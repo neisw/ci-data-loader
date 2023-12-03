@@ -433,6 +433,10 @@ func (i *BigQueryDataItem) Save() (row map[string]bigquery.Value, insertID strin
 			return nil, "", err
 		}
 		rowKey := i.Instance.keyMapper(k)
+		// skip over unknown keys
+		if _, ok := i.Instance.DataFile.Schema[rowKey]; !ok {
+			continue
+		}
 		row[rowKey] = bv
 		if rowKey == i.Instance.DataFile.PartitionColumn {
 			foundPartionValue = true
