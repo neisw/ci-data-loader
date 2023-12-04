@@ -15,9 +15,6 @@ const DataPartitioningField = "PartitionTime"
 const JobRunNameField = "JobRunName"
 const SourceNameField = "Source"
 
-// Not using BigQueryDataCoordinates
-// as we want this to migrate to a Cloud Function
-// limiting use of existing types
 type BigQueryLoader struct {
 	ProjectID string
 	DataSetID string
@@ -65,7 +62,7 @@ func (b *BigQueryLoader) ValidateTable(ctx context.Context, dataInstance DataIns
 	return nil
 }
 
-// validateTable can be called by multiple events at / around the same time
+// validateBQTable can be called by multiple events at / around the same time
 // leading to a race condition creating / updating the schema
 // need to handle exponential backoff / retry in the event of create / update failures.
 func (b *BigQueryLoader) validateBQTable(ctx context.Context, expectedMetaData *bigquery.TableMetadata) (*bigquery.Table, error) {
@@ -128,7 +125,7 @@ func (b *BigQueryLoader) validateTableMetadata(ctx context.Context, expectedMeta
 	// we can update the TimePartitioning Type and Expiration if needed
 	var updatedTimePartitioning *bigquery.TimePartitioning
 
-	// not sure we can add / or change this...
+	// we do not support changing the Partitioning data
 	if existingMetaData.TimePartitioning == nil {
 
 		// if we don't already have the required field or it doesn't match our requirements
