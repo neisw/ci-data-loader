@@ -21,15 +21,6 @@ const (
 	DataTypeJSON      DataType = "json"
 )
 
-// https://pkg.go.dev/cloud.google.com/go/bigquery#Dataset.Tables
-// https://pkg.go.dev/cloud.google.com/go/bigquery#Table
-// create table / update schema
-// everything will use time partitioning https://pkg.go.dev/cloud.google.com/go/bigquery#TimePartitioning
-
-// define interface
-// Validate (create and update table / schema)
-// GetDataItems
-
 type DataFile struct {
 	TableName       string              `json:"table_name"`
 	Schema          map[string]DataType `json:"schema"`

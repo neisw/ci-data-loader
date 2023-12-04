@@ -55,11 +55,76 @@ const (
 	GCSCredentialsFileEnv = "GCS_CREDENTIALS_FILE" // local testing only
 )
 
+var bigQueryClient *bigquery.Client
+var storageClient *storage.Client
+var bigQueryLoader BigQueryLoader
+
+func init() {
+	err := initGlobals(context.TODO())
+
+	if err != nil {
+		logrus.Errorf("Error initializing globals: %v", err)
+	}
+}
+
+func initGlobals(ctx context.Context) error {
+	var err error
+	projectID := os.Getenv(ProjectIdEnv)
+	if len(projectID) == 0 {
+		return fmt.Errorf("Missing ENV Variable: %s", ProjectIdEnv)
+	}
+
+	dataSetId := os.Getenv(DataSetEnv)
+	if len(dataSetId) == 0 {
+		return fmt.Errorf("Missing ENV Variable: %s", DataSetEnv)
+	}
+
+	bigQueryLoader = BigQueryLoader{ProjectID: projectID, DataSetID: dataSetId}
+	credentialsPath := os.Getenv(GCSCredentialsFileEnv)
+	if len(credentialsPath) > 0 {
+		bigQueryClient, err = bigquery.NewClient(ctx,
+			bigQueryLoader.ProjectID,
+			option.WithCredentialsFile(credentialsPath),
+		)
+	} else {
+		bigQueryClient, err = bigquery.NewClient(ctx,
+			bigQueryLoader.ProjectID,
+		)
+	}
+
+	if err != nil {
+		logrus.Errorf("Failed to initialize new bigquery client: %v", err)
+		return err
+	}
+
+	// Technically we will leak connections since we
+	// initialize these globally and don't know when our CF will close
+	// but this is a trade-off for the 'warm start' and shouldn't be an issue
+	// defer bigQueryClient.Close()
+
+	bigQueryLoader.Client = bigQueryClient
+
+	if len(credentialsPath) > 0 {
+		storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly), option.WithCredentialsFile(credentialsPath))
+	} else {
+		storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly))
+	}
+	if err != nil {
+		logrus.Errorf("Failed to initialize new storage client: %v", err)
+		return err
+	}
+
+	// Technically we will leak connections since we
+	// initialize these globally and don't know when our CF will close
+	// but this is a trade-off for the 'warm start' and shouldn't be an issue
+	// defer storageClient.Close()
+
+	return nil
+}
+
 func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	var simpleUploader SimpleUploader
-	var bigQueryClient *bigquery.Client
-	var storageClient *storage.Client
 	var err error
 
 	jobRunData, err := generateJobRunDataEvent(&e)
@@ -82,50 +147,6 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	if len(jobRunData.BuildID) == 0 || len(jobRunData.Job) == 0 || len(jobRunData.Filename) == 0 {
 		logrus.Debugf("Skipping event for: %v", e)
 	}
-
-	projectID := os.Getenv(ProjectIdEnv)
-	if len(projectID) == 0 {
-		return fmt.Errorf("Missing ENV Variable: %s", ProjectIdEnv)
-	}
-
-	dataSetId := os.Getenv(DataSetEnv)
-	if len(dataSetId) == 0 {
-		return fmt.Errorf("Missing ENV Variable: %s", DataSetEnv)
-	}
-
-	bigQueryLoader := BigQueryLoader{ProjectID: projectID, DataSetID: dataSetId}
-	credentialsPath := os.Getenv(GCSCredentialsFileEnv)
-	if len(credentialsPath) > 0 {
-		bigQueryClient, err = bigquery.NewClient(ctx,
-			bigQueryLoader.ProjectID,
-			option.WithCredentialsFile(credentialsPath),
-		)
-	} else {
-		bigQueryClient, err = bigquery.NewClient(ctx,
-			bigQueryLoader.ProjectID,
-		)
-	}
-
-	if err != nil {
-		logrus.Errorf("Failed to initialize new bigquery client: %v", err)
-		return err
-	}
-
-	defer bigQueryClient.Close()
-
-	bigQueryLoader.Client = bigQueryClient
-
-	if len(credentialsPath) > 0 {
-		storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly), option.WithCredentialsFile(credentialsPath))
-	} else {
-		storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly))
-	}
-	if err != nil {
-		logrus.Errorf("Failed to initialize new storage client: %v", err)
-		return err
-	}
-
-	defer storageClient.Close()
 
 	switch {
 

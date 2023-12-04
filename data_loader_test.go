@@ -89,7 +89,7 @@ func TestBigQueryLoaderRows(t *testing.T) {
 				DataFile: &DataFile{
 					TableName:       "test_table",
 					PartitionColumn: DataPartitioningField,
-					Schema:          map[string]DataType{"string1": DataTypeString, "float1": DataTypeFloat64},
+					Schema:          map[string]DataType{"table_string_1": DataTypeString, "float1": DataTypeFloat64},
 					SchemaMapping:   map[string]string{"string1": "table_string_1"},
 					Rows:            []map[string]string{{"string1": "string1_val1.0", "float1": "1.0"}, {"string1": "string1_val2.1", "float1": "2.1"}},
 				},
@@ -104,7 +104,7 @@ func TestBigQueryLoaderRows(t *testing.T) {
 				DataFile: &DataFile{
 					TableName:       "test_table",
 					PartitionColumn: DataPartitioningField,
-					Schema:          map[string]DataType{"string1": DataTypeString, "float1": DataTypeFloat64},
+					Schema:          map[string]DataType{"table_string_1": DataTypeString, "float1": DataTypeFloat64},
 					SchemaMapping:   map[string]string{"string1": "table_string_1"},
 					Rows:            []map[string]string{{"string1": "string1_val1.0", "float1": "1.0 with some text"}, {"string1": "string1_val2.1", "float1": "2.1"}},
 				},
