@@ -8,7 +8,8 @@ deploy: build
 		--service-account job-run-big-query-writer@openshift-gce-devel.iam.gserviceaccount.com \
 		--memory 1024MB --timeout=300s --max-instances=10 \
 		--trigger-resource origin-ci-test --trigger-event google.storage.object.finalize \
-		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl_test
+		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl_test \
+		--docker-registry=artifact-registry
 .PHONY: deploy
 
 deploy-service-account:
