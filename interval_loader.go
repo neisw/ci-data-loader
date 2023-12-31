@@ -71,8 +71,9 @@ func generateIntervalUploader(client *storage.Client, ctx context.Context, event
 	dataInstance := DataInstance{CreationTime: *i.instanceTime, JobRunName: event.BuildID, Source: event.Filename}
 	dataFile := DataFile{
 		TableName:       "e2e_intervals",
-		Schema:          map[string]DataType{"from": DataTypeTimestamp, "to": DataTypeTimestamp, "interval": DataTypeJSON},
-		PartitionColumn: "from",
+		Schema:          map[string]DataType{"from_time": DataTypeTimestamp, "to_time": DataTypeTimestamp, "interval": DataTypeJSON},
+		SchemaMapping:   map[string]string{"from": "from_time", "to": "to_time"},
+		PartitionColumn: "from_time",
 		ChunkSize:       5000,
 		Rows:            rows,
 	}

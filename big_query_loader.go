@@ -16,11 +16,17 @@ const JobRunNameField = "JobRunName"
 const SourceNameField = "Source"
 
 type BigQueryLoader struct {
-	ProjectID string
-	DataSetID string
-	Client    *bigquery.Client
-	Table     *bigquery.Table
-	DryRun    bool
+	ProjectID  string
+	DataSetID  string
+	Client     *bigquery.Client
+	DryRun     bool
+	tableCache map[string]BigQueryTableCache
+}
+
+type BigQueryTableCache struct {
+	metaData  *bigquery.TableMetadata
+	table     *bigquery.Table
+	cacheTime time.Time
 }
 
 type BigQueryDataItem struct {
@@ -46,18 +52,16 @@ func (c *ClientError) Error() string {
 }
 
 func (b *BigQueryLoader) ValidateTable(ctx context.Context, dataInstance DataInstance) error {
-	metaData, err := b.GetMetaData(dataInstance)
+	metaData, err := b.GetMetaData(ctx, dataInstance)
 	if err != nil {
 		return err
 	}
 
 	// if the table exists validate the metadata matches or update it
-	table, err := b.validateBQTable(ctx, &metaData)
+	err = b.validateBQTable(ctx, &metaData)
 	if err != nil {
 		return err
 	}
-
-	b.Table = table
 
 	return nil
 }
@@ -65,12 +69,11 @@ func (b *BigQueryLoader) ValidateTable(ctx context.Context, dataInstance DataIns
 // validateBQTable can be called by multiple events at / around the same time
 // leading to a race condition creating / updating the schema
 // need to handle exponential backoff / retry in the event of create / update failures.
-func (b *BigQueryLoader) validateBQTable(ctx context.Context, expectedMetaData *bigquery.TableMetadata) (*bigquery.Table, error) {
+func (b *BigQueryLoader) validateBQTable(ctx context.Context, expectedMetaData *bigquery.TableMetadata) error {
 	// if it is a client error we will retry
-	var table *bigquery.Table
 	var validationErr error
 	err := wait.ExponentialBackoff(backoff, func() (done bool, err error) {
-		table, validationErr = b.retryableTableValidation(ctx, expectedMetaData)
+		validationErr = b.retryableTableValidation(ctx, expectedMetaData)
 
 		if validationErr != nil {
 			if cerr, ok := err.(*ClientError); ok {
@@ -81,17 +84,46 @@ func (b *BigQueryLoader) validateBQTable(ctx context.Context, expectedMetaData *
 	})
 
 	if err != nil {
-		return nil, validationErr
+		return validationErr
 	}
 
-	return table, nil
+	return nil
 }
-func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedMetaData *bigquery.TableMetadata) (*bigquery.Table, error) {
+func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedMetaData *bigquery.TableMetadata) error {
 	dataSet := b.Client.Dataset(b.DataSetID)
 
 	if dataSet == nil {
-		return nil, fmt.Errorf("dataset (%s) does not exist", b.DataSetID)
+		return fmt.Errorf("dataset (%s) does not exist", b.DataSetID)
 	}
+
+	// see if we have already fetched the metadata
+	// if so, see if it matches
+	// if not, then do a lookup and check again
+	// if it still doesn't match then try the migration
+	if b.tableCache == nil {
+		b.tableCache = make(map[string]BigQueryTableCache)
+	}
+
+	cachedTable, ok := b.tableCache[expectedMetaData.Name]
+
+	if ok {
+		// if we cached the table more than an hour ago let it fall through
+		// so we look it up again
+		if cachedTable.table != nil && cachedTable.metaData != nil && cachedTable.cacheTime.After(time.Now().Add(-1*time.Hour)) {
+			hasUpdate, err := b.validateTableMetadata(ctx, expectedMetaData, cachedTable.metaData, cachedTable.table, true)
+			if err != nil {
+				return err
+			}
+			// no changes between our cached metaData and the incoming metaData so skip the lookup and
+			// return
+			if !hasUpdate {
+				return nil
+			}
+		}
+	}
+
+	// if we reach this point then invalidate any cache we have for this table
+	delete(b.tableCache, expectedMetaData.Name)
 
 	table := dataSet.Table(expectedMetaData.Name)
 	existingMetaData, err := table.Metadata(ctx)
@@ -104,53 +136,92 @@ func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedM
 			}
 		}
 
-		return nil, err
+		return err
 	}
 
-	return b.validateTableMetadata(ctx, expectedMetaData, existingMetaData, table)
+	hasUpdate, err := b.validateTableMetadata(ctx, expectedMetaData, existingMetaData, table, false)
+
+	if err != nil {
+		return err
+	}
+
+	if hasUpdate {
+		// get the current metadata
+		// we have to look it up again if we
+		// just changed it
+		existingMetaData, err = table.Metadata(ctx)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	// store our most recent version in the cache
+	cachedTable = BigQueryTableCache{table: table, metaData: existingMetaData, cacheTime: time.Now()}
+	b.tableCache[expectedMetaData.Name] = cachedTable
+
+	return nil
 }
 
-func (b *BigQueryLoader) createTable(ctx context.Context, expectedMetaData *bigquery.TableMetadata, table *bigquery.Table) (*bigquery.Table, error) {
+func (b *BigQueryLoader) createTable(ctx context.Context, expectedMetaData *bigquery.TableMetadata, table *bigquery.Table) error {
 	err := table.Create(ctx, expectedMetaData)
 
 	if err != nil {
-		return nil, &ClientError{Err: err, Call: "Create"}
+		return &ClientError{Err: err, Call: "Create"}
 	}
 
-	return table, nil
+	// update our cache with the newly created table data
+	b.tableCache[expectedMetaData.Name] = BigQueryTableCache{metaData: expectedMetaData, table: table, cacheTime: time.Now()}
+
+	return nil
 }
 
-func (b *BigQueryLoader) validateTableMetadata(ctx context.Context, expectedMetaData *bigquery.TableMetadata, existingMetaData *bigquery.TableMetadata, table *bigquery.Table) (*bigquery.Table, error) {
+func (b *BigQueryLoader) validateTableMetadata(ctx context.Context, expectedMetaData *bigquery.TableMetadata, existingMetaData *bigquery.TableMetadata, table *bigquery.Table, dryRun bool) (bool, error) {
 	// validate our time partitioning field matches
-	// we can update the TimePartitioning Type and Expiration if needed
-	var updatedTimePartitioning *bigquery.TimePartitioning
 
-	// we do not support changing the Partitioning data
-	if existingMetaData.TimePartitioning == nil {
+	// we do not support changing the Partitioning column
 
-		// if we don't already have the required field or it doesn't match our requirements
-		// then error out
-		existingField := findField(existingMetaData.Schema, expectedMetaData.TimePartitioning.Field)
-		if existingField == nil {
-			return nil, fmt.Errorf("Missing time partitioned field in the existing schema: %s", expectedMetaData.TimePartitioning.Field)
-		}
+	//	not going to change anything about the partitioning
+	//	make sure the field is in the schema is all
+	//	report warnings if the existing and expected differ
 
-		expectedField := findField(expectedMetaData.Schema, expectedMetaData.TimePartitioning.Field)
-		// this would be a problem in our code...
-		if expectedField == nil {
-			return nil, fmt.Errorf("Missing time partitioned field in the expected schema: %s", expectedMetaData.TimePartitioning.Field)
-		}
-
-		if expectedField.Required != existingField.Required {
-			return nil, fmt.Errorf("Existing time partition field required status does not match.  Expected: %v, Existing: %v", expectedField.Required, existingField.Required)
-		}
-
-		if expectedField.Type != existingField.Type {
-			return nil, fmt.Errorf("Existing time partition field type does not match.  Expected: %v, Existing: %v", expectedField.Type, existingField.Type)
-		}
-
-		updatedTimePartitioning = expectedMetaData.TimePartitioning
-	}
+	// if existingMetaData.TimePartitioning == nil {
+	//
+	// 	// if we don't already have the required field or it doesn't match our requirements
+	// 	// then error out
+	// 	existingField := findField(existingMetaData.Schema, expectedMetaData.TimePartitioning.Field)
+	// 	if existingField == nil {
+	// 		return false, fmt.Errorf("missing time partitioned field in the existing schema: %s", expectedMetaData.TimePartitioning.Field)
+	// 	}
+	//
+	// 	expectedField := findField(expectedMetaData.Schema, expectedMetaData.TimePartitioning.Field)
+	// 	// this would be a problem in our code...
+	// 	if expectedField == nil {
+	// 		return false, fmt.Errorf("missing time partitioned field in the expected schema: %s", expectedMetaData.TimePartitioning.Field)
+	// 	}
+	//
+	// 	if expectedField.Required != existingField.Required {
+	// 		return false, fmt.Errorf("existing time partition field required status does not match.  Expected: %v, Existing: %v", expectedField.Required, existingField.Required)
+	// 	}
+	//
+	// 	if expectedField.Type != existingField.Type {
+	// 		return false, fmt.Errorf("existing time partition field type does not match.  Expected: %v, Existing: %v", expectedField.Type, existingField.Type)
+	// 	}
+	//
+	// 	updatedTimePartitioning = expectedMetaData.TimePartitioning
+	// } else {
+	// 	if existingMetaData.TimePartitioning.Field != expectedMetaData.TimePartitioning.Field {
+	// 		return false, fmt.Errorf("existing time partition field '%s' does not match expected field: %s", existingMetaData.TimePartitioning.Field, expectedMetaData.TimePartitioning.Field)
+	// 	}
+	//
+	// 	if expectedMetaData.TimePartitioning.Type != expectedMetaData.TimePartitioning.Type {
+	// 		if updatedTimePartitioning == nil {
+	// 			updatedTimePartitioning = &bigquery.TimePartitioning{Type: expectedMetaData.TimePartitioning.Type}
+	// 		}
+	// 	}
+	//
+	// 	change expiration , yes if allowed
+	// }
 
 	// check to see if our schema has any columns that don't currently exist
 	// if so then we add them keeping all that already exist, we don't currently drop columns
@@ -163,69 +234,46 @@ func (b *BigQueryLoader) validateTableMetadata(ctx context.Context, expectedMeta
 		// but not ok if expected is required and existing isn't
 		if expectedField.Required {
 			if existingField == nil {
-				return nil, fmt.Errorf("field %s is required but is missing in the existing schema", expectedField.Name)
+				return false, fmt.Errorf("field %s is required but is missing in the existing schema", expectedField.Name)
 			}
 			if !existingField.Required {
-				return nil, fmt.Errorf("field %s is required but optional in the existing schema", expectedField.Name)
+				return false, fmt.Errorf("field %s is required but optional in the existing schema", expectedField.Name)
 			}
 		}
 
 		if existingField == nil {
 			missingFields = append(missingFields, expectedField)
 		} else if expectedField.Type != existingField.Type {
-			return nil, fmt.Errorf("field %s expected type: %s does not match existing schema type: %s", expectedField.Name, expectedField.Type, existingField.Type)
+			return false, fmt.Errorf("field %s expected type: %s does not match existing schema type: %s", expectedField.Name, expectedField.Type, existingField.Type)
 		}
 	}
 
-	if len(missingFields) > 0 || updatedTimePartitioning != nil {
-		// something to update so lets try
-		update := bigquery.TableMetadataToUpdate{
-			TimePartitioning: updatedTimePartitioning,
+	if len(missingFields) > 0 { // || updatedTimePartitioning != nil {
+
+		// if we are in dryRun mode and the schema has changed then return true indicating the schema has changes
+		if dryRun {
+			return true, nil
 		}
+
+		// something to update so lets try
+		update := bigquery.TableMetadataToUpdate{}
 
 		if len(missingFields) > 0 {
 			update.Schema = append(existingMetaData.Schema, missingFields...)
 		}
 
-		// handle back off / retry
+		if table == nil {
+			return false, fmt.Errorf("missing table for: %s", existingMetaData.Name)
+		}
 
 		_, err := table.Update(ctx, update, existingMetaData.ETag)
 		if err != nil {
-			return nil, &ClientError{Err: err, Call: "Update"}
+			return false, &ClientError{Err: err, Call: "Update"}
 		}
-
-	}
-	return table, nil
-
-}
-
-func (b *BigQueryLoader) DeleteExistingData(ctx context.Context, partitionTime time.Time, partitionColumn, tableName, jobRunName, source string) error {
-
-	deleteFromDate := partitionTime.Add(-2 * 24 * time.Hour)
-
-	deleteQuery := fmt.Sprintf("DELETE FROM `%s.%s` WHERE %s > TIMESTAMP(\"%s\") AND %s = \"%s\" AND %s = \"%s\"", b.DataSetID, tableName, partitionColumn, deleteFromDate.Format(time.RFC3339), JobRunNameField, jobRunName, SourceNameField, source)
-
-	q := b.Client.Query(deleteQuery)
-
-	// q.DryRun = true
-	job, err := q.Run(ctx)
-
-	if err != nil {
-		return err
+		return true, nil
 	}
 
-	js, err := job.Wait(ctx)
-	if err != nil {
-		return err
-	}
-
-	if js.Err() != nil {
-		return js.Err()
-	}
-
-	// more checks for js?
-
-	return nil
+	return false, nil
 }
 
 func (b *BigQueryLoader) FindExistingData(ctx context.Context, partitionTime time.Time, partitionColumn, tableName, jobRunName, source string) (uint64, error) {
@@ -261,7 +309,7 @@ func findField(schema bigquery.Schema, name string) *bigquery.FieldSchema {
 	return nil
 }
 
-func (b *BigQueryLoader) GetMetaData(di DataInstance) (bigquery.TableMetadata, error) {
+func (b *BigQueryLoader) GetMetaData(ctx context.Context, di DataInstance) (bigquery.TableMetadata, error) {
 
 	var timePartitioningType bigquery.TimePartitioningType
 	switch bigquery.TimePartitioningType(di.DataFile.PartitionType) {
@@ -285,7 +333,7 @@ func (b *BigQueryLoader) GetMetaData(di DataInstance) (bigquery.TableMetadata, e
 	if di.DataFile.ExpirationDays > 0 && di.DataFile.ExpirationDays < 2*expiration {
 		expiration = di.DataFile.ExpirationDays
 	} else if di.DataFile.ExpirationDays > 0 {
-		logrus.Warnf("Expiration days out of range: %d", di.DataFile.ExpirationDays)
+		logwithctx(ctx).Warnf("Expiration days out of range: %d", di.DataFile.ExpirationDays)
 	}
 
 	schema := bigquery.Schema{}
@@ -358,7 +406,12 @@ func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataIns
 
 	var inserter *bigquery.Inserter
 	if !b.DryRun {
-		inserter = b.Table.Inserter()
+		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
+
+		if !ok || tableCache.table == nil {
+			return nil, fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
+		}
+		inserter = tableCache.table.Inserter()
 	}
 	// JobRunName and CreationTime are required
 	if len(dataInstance.JobRunName) == 0 {
@@ -402,7 +455,7 @@ func insertRows(ctx context.Context, inserter *bigquery.Inserter, items []interf
 
 	// do something more with the error?
 	if err != nil {
-		logrus.Errorf("Error inserting records: %v", err)
+		logwithctx(ctx).Errorf("Error inserting records: %v", err)
 	}
 }
 

@@ -223,7 +223,7 @@ func TestBigQueryLoaderMetaData(t *testing.T) {
 	bigQueryLoader := BigQueryLoader{}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			metaData, err := bigQueryLoader.GetMetaData(test.dataInstance)
+			metaData, err := bigQueryLoader.GetMetaData(nil, test.dataInstance)
 
 			assert.Nil(t, err, "%s: Unexpected error %v", test.name, err)
 			assert.NotNil(t, metaData)
