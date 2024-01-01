@@ -19,6 +19,7 @@ const (
 	// RFC3339  based value "2006-01-02T15:04:05Z07:00
 	DataTypeTimestamp DataType = "timestamp"
 	DataTypeJSON      DataType = "json"
+	DataTypeBool      DataType = "bool"
 )
 
 type DataFile struct {
@@ -87,6 +88,7 @@ func generateDataFileUploader(client *storage.Client, ctx context.Context, event
 }
 
 func UnMarshalJSON(jsonb []byte, result interface{}) error {
+	// TODO: research using https://github.com/goccy/go-json
 	err := json.Unmarshal(jsonb, result)
 	if err != nil {
 		return fmt.Errorf("cannot decode JSON: %v", err)
@@ -129,6 +131,8 @@ func (d *DataInstance) valueMapper(key, value string) (any, error) {
 			return strconv.ParseInt(value, 10, 64)
 		case DataTypeTimestamp:
 			return time.Parse(time.RFC3339, value)
+		case DataTypeBool:
+			return strconv.ParseBool(value)
 		}
 	}
 

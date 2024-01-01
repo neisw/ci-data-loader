@@ -32,7 +32,7 @@ func generateMetricsUploader(client *storage.Client, ctx context.Context, event 
 	dataFile := DataFile{
 		TableName: "e2e_metrics",
 		Schema:    map[string]DataType{"value": DataTypeFloat64, "timestamp": DataTypeInteger, "key": DataTypeString},
-		ChunkSize: 1,
+		ChunkSize: 1000,
 		Rows:      rows,
 	}
 

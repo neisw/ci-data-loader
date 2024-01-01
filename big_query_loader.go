@@ -14,6 +14,8 @@ import (
 const DataPartitioningField = "PartitionTime"
 const JobRunNameField = "JobRunName"
 const SourceNameField = "Source"
+const internalWriteLog = "internal_write_log"
+const internalWriteLogCompleted = "Completed"
 
 type BigQueryLoader struct {
 	ProjectID  string
@@ -49,6 +51,22 @@ type ClientError struct {
 
 func (c *ClientError) Error() string {
 	return fmt.Sprintf("client call %s: err %v", c.Call, c.Err)
+}
+
+func (b *BigQueryLoader) Init(ctx context.Context) error {
+	// we don't need the instance other than to host the dataFile
+	dataInstance := DataInstance{CreationTime: time.Now(), JobRunName: "startup", Source: "internal"}
+	dataFile := DataFile{
+		TableName: internalWriteLog,
+		Schema:    map[string]DataType{internalWriteLogCompleted: DataTypeBool},
+		ChunkSize: 1000,
+	}
+
+	dataInstance.DataFile = &dataFile
+
+	return b.ValidateTable(ctx, dataInstance)
+
+	return nil
 }
 
 func (b *BigQueryLoader) ValidateTable(ctx context.Context, dataInstance DataInstance) error {
@@ -276,28 +294,62 @@ func (b *BigQueryLoader) validateTableMetadata(ctx context.Context, expectedMeta
 	return false, nil
 }
 
-func (b *BigQueryLoader) FindExistingData(ctx context.Context, partitionTime time.Time, partitionColumn, tableName, jobRunName, source string) (uint64, error) {
+func (b *BigQueryLoader) FindExistingData(ctx context.Context, partitionTime time.Time, partitionColumn, tableName, jobRunName, source string) (bool, error) {
+
+	// first check for an entry in our write log table, if the entry is marked complete then return true
+	// if the entry doesn't exist then return false
+	// if the entry exists but isn't marked complete see if we have any data in the actual table
 
 	countFromDate := partitionTime.Add(-2 * 24 * time.Hour)
+	countToDate := partitionTime.Add(2 * 24 * time.Hour)
 
-	countQuery := fmt.Sprintf("SELECT COUNT(*) AS TotalRows FROM `%s.%s` WHERE `%s` > TIMESTAMP(\"%s\") AND %s = \"%s\" AND %s = \"%s\"", b.DataSetID, tableName, partitionColumn, countFromDate.Format(time.RFC3339), JobRunNameField, jobRunName, SourceNameField, source)
+	countCompletedQuery := fmt.Sprintf("SELECT TableTemp.TotalRows, TableTemp.CompletedRows FROM ((SELECT(SELECT COUNT(*) FROM `%s.%s` WHERE `%s` > TIMESTAMP(\"%s\") AND `%s` < TIMESTAMP(\"%s\") AND %s = \"%s\" AND %s = \"%s\") AS TotalRows, (SELECT(SELECT COUNT(*) FROM `%s.%s` WHERE `%s` > TIMESTAMP(\"%s\") AND `%s` < TIMESTAMP(\"%s\") AND %s = \"%s\" AND %s = \"%s\" AND %s IS TRUE) ) AS CompletedRows )) AS TableTemp", b.DataSetID, internalWriteLog, DataPartitioningField, countFromDate.Format(time.RFC3339), DataPartitioningField, countToDate.Format(time.RFC3339), JobRunNameField, jobRunName, SourceNameField, source, b.DataSetID, internalWriteLog, DataPartitioningField, countFromDate.Format(time.RFC3339), DataPartitioningField, countToDate.Format(time.RFC3339), JobRunNameField, jobRunName, SourceNameField, source, internalWriteLogCompleted)
 
+	rowCount, completedCount, err := b.readRowCounts(ctx, countCompletedQuery)
+
+	if err == nil {
+		// if the query completed and we have no record then we have no record of it
+		if rowCount < 1 {
+			return false, nil
+		}
+
+		// if we have a row count and completedCount is < 1 then we will fall through and check for existing data
+		if completedCount > 0 {
+			return true, nil
+		}
+
+	}
+
+	countQuery := fmt.Sprintf("SELECT COUNT(*) AS TotalRows FROM `%s.%s` WHERE `%s` > TIMESTAMP(\"%s\") AND `%s` < TIMESTAMP(\"%s\") AND %s = \"%s\" AND %s = \"%s\"", b.DataSetID, tableName, partitionColumn, countFromDate.Format(time.RFC3339), partitionColumn, countToDate.Format(time.RFC3339), JobRunNameField, jobRunName, SourceNameField, source)
+
+	rowCount, _, err = b.readRowCounts(ctx, countQuery)
+
+	if err != nil {
+		return false, err
+	}
+
+	return rowCount > 0, nil
+}
+
+func (b *BigQueryLoader) readRowCounts(ctx context.Context, countQuery string) (uint64, uint64, error) {
 	query := b.Client.Query(countQuery)
 
 	var rowCount struct {
-		TotalRows int64
+		TotalRows     int64
+		CompletedRows int64
 	}
+
 	it, err := query.Read(ctx)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	err = it.Next(&rowCount)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
-	return uint64(rowCount.TotalRows), nil
+	return uint64(rowCount.TotalRows), uint64(rowCount.CompletedRows), nil
 }
 
 func findField(schema bigquery.Schema, name string) *bigquery.FieldSchema {
@@ -392,6 +444,8 @@ func (b *BigQueryLoader) getBQSchema(di DataInstance, schema bigquery.Schema) bi
 			bqFieldType = bigquery.StringFieldType
 		case DataTypeInteger:
 			bqFieldType = bigquery.IntegerFieldType
+		case DataTypeBool:
+			bqFieldType = bigquery.BooleanFieldType
 		default:
 			logrus.Warnf("Unknown field type detected: %s", v)
 			continue
@@ -404,6 +458,23 @@ func (b *BigQueryLoader) getBQSchema(di DataInstance, schema bigquery.Schema) bi
 
 func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataInstance) ([]interface{}, error) {
 
+	// JobRunName and CreationTime are required
+	if len(dataInstance.JobRunName) == 0 {
+		return nil, fmt.Errorf("missing Job run name")
+	}
+
+	if dataInstance.CreationTime.IsZero() {
+		return nil, fmt.Errorf("missing creation time")
+	}
+
+	// https://cloud.google.com/bigquery/docs/sessions-intro
+	// https://cloud.google.com/bigquery/docs/transactions
+	// could look at using sessions and transactions
+	// for now just use a 3 part sequence to capture
+	// we attempted to write the data
+	// the data is written
+	// we succeeded in writing the data
+
 	var inserter *bigquery.Inserter
 	if !b.DryRun {
 		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
@@ -412,14 +483,22 @@ func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataIns
 			return nil, fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
 		}
 		inserter = tableCache.table.Inserter()
-	}
-	// JobRunName and CreationTime are required
-	if len(dataInstance.JobRunName) == 0 {
-		return nil, fmt.Errorf("missing Job run name")
-	}
 
-	if dataInstance.CreationTime.IsZero() {
-		return nil, fmt.Errorf("missing creation time")
+		// create an entry in the write log table
+		q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s) VALUES('%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), "false"))
+		job, err := q.Run(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error creating write log entry %v", err)
+		}
+
+		status, err := job.Wait(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error inserting write log entry %v", err)
+		}
+
+		if !status.Done() {
+			return nil, fmt.Errorf("error completing write log insert job")
+		}
 	}
 
 	diRows := make([]interface{}, 0)
@@ -444,6 +523,23 @@ func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataIns
 		insertRows(ctx, inserter, diRows)
 	} else {
 		return diRows, nil
+	}
+
+	// mark our write log entry complete
+	// we won't return errors here but will log warnings
+	q := b.Client.Query(fmt.Sprintf("UPDATE %s.%s SET %s = %s WHERE %s = '%s' AND %s = '%s' AND %s = TIMESTAMP('%s')", b.DataSetID, internalWriteLog, internalWriteLogCompleted, "true", JobRunNameField, dataInstance.JobRunName, SourceNameField, dataInstance.Source, DataPartitioningField, dataInstance.CreationTime.Format(time.RFC3339)))
+	job, err := q.Run(ctx)
+	if err != nil {
+		logwithctx(ctx).Warnf(fmt.Sprintf("error completing write log entry %v", err))
+	}
+
+	status, err := job.Wait(ctx)
+	if err != nil {
+		logwithctx(ctx).Warnf(fmt.Sprintf("error updating write log entry completion %v", err))
+	}
+
+	if !status.Done() {
+		logwithctx(ctx).Warnf(fmt.Sprintf("error completing write log completion job"))
 	}
 
 	return nil, nil

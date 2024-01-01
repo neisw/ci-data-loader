@@ -122,6 +122,12 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 	// defer bigQueryClient.Close()
 
 	newCache.bigQueryLoader.Client = bigQueryClient
+	err = newCache.bigQueryLoader.Init(ctx)
+
+	if err != nil {
+		logrus.Errorf("Failed to initialize new bigquery loader: %v", err)
+		return nil, err
+	}
 
 	if len(credentialsPath) > 0 {
 		newCache.storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly), option.WithCredentialsFile(credentialsPath))
@@ -149,7 +155,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	// our tokens expire periodically
 	// until we code it so we can detect the failure and recover
 	// periodically refresh our clients
-	if clientsCache == nil || clientsCache.cachedTime.Before(time.Now().Add(-2*time.Hour)) {
+	if clientsCache == nil /*|| clientsCache.cachedTime.Before(time.Now().Add(-2*time.Hour))*/ {
 		initClientCache()
 	}
 

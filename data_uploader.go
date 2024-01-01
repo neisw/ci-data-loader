@@ -8,7 +8,7 @@ import (
 
 type DataLoader interface {
 	ValidateTable(ctx context.Context, dataInstance DataInstance) error
-	FindExistingData(ctx context.Context, partitionTime time.Time, partitionColumn, tableName, jobRunName, source string) (uint64, error)
+	FindExistingData(ctx context.Context, partitionTime time.Time, partitionColumn, tableName, jobRunName, source string) (bool, error)
 	LoadDataItems(ctx context.Context, dataInstance DataInstance) ([]interface{}, error)
 }
 
@@ -44,7 +44,7 @@ func (d *DataUploader) upload(ctx context.Context) error {
 
 	if err != nil {
 		return err
-	} else if existing > 0 {
+	} else if existing {
 		// we don't want duplicate data so if we have records already then fail
 		return fmt.Errorf("found existing data for %s/%s", d.dataInstance.JobRunName, d.dataInstance.Source)
 	}
