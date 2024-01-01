@@ -32,7 +32,7 @@ func generateMetricsUploader(client *storage.Client, ctx context.Context, event 
 	dataFile := DataFile{
 		TableName: "e2e_metrics",
 		Schema:    map[string]DataType{"value": DataTypeFloat64, "timestamp": DataTypeInteger, "key": DataTypeString},
-		ChunkSize: 1,
+		ChunkSize: 1000,
 		Rows:      rows,
 	}
 
@@ -56,6 +56,10 @@ func (m *metricsLoader) parseRows(client *storage.Client, ctx context.Context, b
 
 	rows := make([]map[string]string, 0)
 	for k, v := range output {
+
+		if v.Value == "NaN" {
+			continue
+		}
 
 		sv := strconv.FormatInt(v.Timestamp, 10)
 		if sv == "NaN" {

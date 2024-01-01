@@ -55,46 +55,65 @@ const (
 	GCSCredentialsFileEnv = "GCS_CREDENTIALS_FILE" // local testing only
 )
 
-var bigQueryClient *bigquery.Client
-var storageClient *storage.Client
-var bigQueryLoader BigQueryLoader
+var clientsCache *ClientsCache
+
+type ClientsCache struct {
+	storageClient  *storage.Client
+	bigQueryLoader *BigQueryLoader
+	cachedTime     time.Time
+}
 
 func init() {
-	err := initGlobals(context.TODO())
+	initClientCache()
+}
+
+func initClientCache() {
+	newCache, err := initGlobals(context.TODO())
 
 	if err != nil {
 		logrus.Errorf("Error initializing globals: %v", err)
+		return
 	}
+
+	// if we aren't nil then attempt to close any open connections
+	if clientsCache != nil {
+		clientsCache.storageClient.Close()
+		clientsCache.bigQueryLoader.Client.Close()
+	}
+
+	clientsCache = newCache
 }
 
-func initGlobals(ctx context.Context) error {
+func initGlobals(ctx context.Context) (*ClientsCache, error) {
 	var err error
 	projectID := os.Getenv(ProjectIdEnv)
 	if len(projectID) == 0 {
-		return fmt.Errorf("Missing ENV Variable: %s", ProjectIdEnv)
+		return nil, fmt.Errorf("missing ENV Variable: %s", ProjectIdEnv)
 	}
 
 	dataSetId := os.Getenv(DataSetEnv)
 	if len(dataSetId) == 0 {
-		return fmt.Errorf("Missing ENV Variable: %s", DataSetEnv)
+		return nil, fmt.Errorf("missing ENV Variable: %s", DataSetEnv)
 	}
 
-	bigQueryLoader = BigQueryLoader{ProjectID: projectID, DataSetID: dataSetId}
+	var bigQueryClient *bigquery.Client
+	newCache := ClientsCache{cachedTime: time.Now()}
+	newCache.bigQueryLoader = &BigQueryLoader{ProjectID: projectID, DataSetID: dataSetId}
 	credentialsPath := os.Getenv(GCSCredentialsFileEnv)
 	if len(credentialsPath) > 0 {
 		bigQueryClient, err = bigquery.NewClient(ctx,
-			bigQueryLoader.ProjectID,
+			newCache.bigQueryLoader.ProjectID,
 			option.WithCredentialsFile(credentialsPath),
 		)
 	} else {
 		bigQueryClient, err = bigquery.NewClient(ctx,
-			bigQueryLoader.ProjectID,
+			newCache.bigQueryLoader.ProjectID,
 		)
 	}
 
 	if err != nil {
 		logrus.Errorf("Failed to initialize new bigquery client: %v", err)
-		return err
+		return nil, err
 	}
 
 	// Technically we will leak connections since we
@@ -102,16 +121,22 @@ func initGlobals(ctx context.Context) error {
 	// but this is a trade-off for the 'warm start' and shouldn't be an issue
 	// defer bigQueryClient.Close()
 
-	bigQueryLoader.Client = bigQueryClient
+	newCache.bigQueryLoader.Client = bigQueryClient
+	err = newCache.bigQueryLoader.Init(ctx)
+
+	if err != nil {
+		logrus.Errorf("Failed to initialize new bigquery loader: %v", err)
+		return nil, err
+	}
 
 	if len(credentialsPath) > 0 {
-		storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly), option.WithCredentialsFile(credentialsPath))
+		newCache.storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly), option.WithCredentialsFile(credentialsPath))
 	} else {
-		storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly))
+		newCache.storageClient, err = storage.NewClient(context.TODO(), option.WithScopes(storage.ScopeReadOnly))
 	}
 	if err != nil {
 		logrus.Errorf("Failed to initialize new storage client: %v", err)
-		return err
+		return nil, err
 	}
 
 	// Technically we will leak connections since we
@@ -119,13 +144,20 @@ func initGlobals(ctx context.Context) error {
 	// but this is a trade-off for the 'warm start' and shouldn't be an issue
 	// defer storageClient.Close()
 
-	return nil
+	return &newCache, nil
 }
 
 func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	var simpleUploader SimpleUploader
 	var err error
+
+	// our tokens expire periodically
+	// until we code it so we can detect the failure and recover
+	// periodically refresh our clients
+	if clientsCache == nil /*|| clientsCache.cachedTime.Before(time.Now().Add(-2*time.Hour))*/ {
+		initClientCache()
+	}
 
 	jobRunData, err := generateJobRunDataEvent(&e)
 
@@ -148,33 +180,44 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		logrus.Debugf("Skipping event for: %v", e)
 	}
 
+	ctx = addlogctx(ctx, jobRunData.BuildID, jobRunData.Job, jobRunData.Filename)
+
+	// might move this into the interface
+	var dataType = ""
+
 	switch {
 
 	case "job_metrics.json" == jobRunData.Filename:
-		simpleUploader, err = generateMetricsUploader(storageClient, ctx, jobRunData, &bigQueryLoader)
+		simpleUploader, err = generateMetricsUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+		dataType = "metrics"
 
 	case strings.HasSuffix(jobRunData.Filename, AutoDataLoaderSuffix):
-		simpleUploader, err = generateDataFileUploader(storageClient, ctx, jobRunData, &bigQueryLoader)
+		simpleUploader, err = generateDataFileUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+		dataType = "autodl"
 
 	case strings.HasPrefix(jobRunData.Filename, "e2e-events"):
-		simpleUploader, err = generateIntervalUploader(storageClient, ctx, jobRunData, &bigQueryLoader)
+		simpleUploader, err = generateIntervalUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+		dataType = "intervals"
 
 	default:
 		return nil
 	}
 
 	if err != nil {
-		logrus.Errorf("Failed to initialize simple loader: %v", err)
+		logwithctx(ctx).Errorf("Failed to initialize simple loader: %v", err)
 		return err
 	}
 
+	startTime := time.Now()
 	err = simpleUploader.upload(ctx)
 
 	if err != nil {
-		logrus.Errorf("Failed to upload loader: %v", err)
+		logwithctx(ctx).Errorf("Failed to upload loader: %v", err)
 		return err
 	}
 
+	diff := int64(time.Now().Sub(startTime) / time.Millisecond)
+	logwithctx(ctx).Infof("processing %s upload completed: %dms", dataType, diff)
 	return nil
 }
 
