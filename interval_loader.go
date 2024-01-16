@@ -1,14 +1,15 @@
 package cidataloader
 
 import (
-	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/sirupsen/logrus"
 	"io"
 	"reflect"
 	"time"
+
+	"cloud.google.com/go/storage"
+	"github.com/sirupsen/logrus"
 )
 
 type intervalLoader struct {
@@ -72,7 +73,7 @@ func generateIntervalUploader(client *storage.Client, ctx context.Context, event
 	dataFile := DataFile{
 		TableName:       "e2e_intervals",
 		Schema:          map[string]DataType{"from_time": DataTypeTimestamp, "to_time": DataTypeTimestamp, "interval": DataTypeJSON},
-		SchemaMapping:   map[string]string{"from": "from_time", "to": "to_time"},
+		SchemaMapping:   map[string]string{"from": "from_time", "to": "to_time", "interval": "interval_json"},
 		PartitionColumn: "from_time",
 		ChunkSize:       5000,
 		Rows:            rows,
