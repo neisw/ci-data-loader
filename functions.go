@@ -147,15 +147,19 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 	return &newCache, nil
 }
 
+func LoadJobRunDataTest(ctx context.Context, e GCSEvent) error {
+	return LoadJobRunData(ctx, e)
+}
+
 func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	var simpleUploader SimpleUploader
 	var err error
 
-	// our tokens expire periodically
-	// until we code it so we can detect the failure and recover
+	// initially added when our SA was deleted
+	// may not be needed but if we are long running then
 	// periodically refresh our clients
-	if clientsCache == nil /*|| clientsCache.cachedTime.Before(time.Now().Add(-2*time.Hour))*/ {
+	if clientsCache == nil || clientsCache.cachedTime.Before(time.Now().Add(-24*time.Hour)) {
 		initClientCache()
 	}
 
