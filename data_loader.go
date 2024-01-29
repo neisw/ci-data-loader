@@ -77,7 +77,7 @@ func generateDataFileUploader(client *storage.Client, ctx context.Context, event
 	}
 
 	// then a data Instance
-	dataInstance := DataInstance{JobRunName: event.Job, CreationTime: creationTime, Source: event.Filename, DataFile: &df}
+	dataInstance := DataInstance{JobRunName: event.BuildID, CreationTime: creationTime, Source: event.Filename, DataFile: &df}
 
 	loader, err := generateDataUploader(dataInstance, dataLoader)
 	if err != nil {
