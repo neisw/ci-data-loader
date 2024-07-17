@@ -266,13 +266,15 @@ func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
 			return nil
 		}
 	case parts[0] == "pr-logs":
-		if !prJobsEnabled {
+		// we want to collect risk-analysis artifacts for pr jobs
+		fileNameBase := path.Base(j.GCSEvent.Name)
+		if !prJobsEnabled && !strings.HasPrefix(fileNameBase, "risk-analysis-") {
 			return nil
 		}
 		// pr-logs/pull/28431/pull-ci-openshift-origin-master-e2e-gcp-ovn-upgrade/1730318696951320576
 		job = parts[3]
 		build = parts[4]
-		base = path.Base(j.GCSEvent.Name)
+		base = fileNameBase
 	default:
 		// log.Printf("Skip job that is not postsubmit/periodic: %s", e.Name)
 		return nil
