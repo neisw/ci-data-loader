@@ -9,6 +9,7 @@ import (
 	"google.golang.org/api/option"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -56,6 +57,7 @@ const (
 )
 
 var clientsCache *ClientsCache
+var buildIdMatch = regexp.MustCompile(`^\d`)
 
 type ClientsCache struct {
 	storageClient  *storage.Client
@@ -272,9 +274,17 @@ func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
 			return nil
 		}
 		// pr-logs/pull/28431/pull-ci-openshift-origin-master-e2e-gcp-ovn-upgrade/1730318696951320576
-		job = parts[3]
-		build = parts[4]
+		baseIndex := 3
+		padding := 0
+		// try to detect if the 4 index is numeric, if not bump it out 1
+		if !buildIdMatch.MatchString(parts[baseIndex+padding+1]) {
+			padding += 1
+		}
+
+		job = parts[baseIndex+padding]
+		build = parts[baseIndex+padding+1]
 		base = fileNameBase
+		logrus.Infof("pr-logs job for %s: Job: %s, Build: %s, Base: %s", j.GCSEvent.Name, job, build, base)
 	default:
 		// log.Printf("Skip job that is not postsubmit/periodic: %s", e.Name)
 		return nil
