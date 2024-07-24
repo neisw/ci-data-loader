@@ -45,8 +45,9 @@ func (d *DataUploader) upload(ctx context.Context) error {
 	if err != nil {
 		return err
 	} else if existing {
-		// we don't want duplicate data so if we have records already then fail
-		return fmt.Errorf("found existing data for %s/%s", d.dataInstance.JobRunName, d.dataInstance.Source)
+		// we don't want duplicate data so if we have records already then log a warning and return nil so the function doesn't retry
+		logwithctx(ctx).Warnf("found existing data for %s/%s", d.dataInstance.JobRunName, d.dataInstance.Source)
+		return nil
 	}
 
 	_, err = d.dataLoader.LoadDataItems(ctx, d.dataInstance)

@@ -131,7 +131,9 @@ func (m *metricsLoader) getJSONMetrics(client *storage.Client, ctx context.Conte
 		rows++
 	}
 	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to decode metric on line %d: %v", rows+1, err)
+		// we don't want to retry so log the error but return nil
+		logwithctx(ctx).Errorf("failed to decode metric on line %d: %v", rows+1, err)
+		return nil, nil
 	}
 
 	outputMetrics := make(map[string]OutputMetric, len(metrics))
@@ -188,7 +190,9 @@ func (m *metricsLoader) getJSONMetrics(client *storage.Client, ctx context.Conte
 
 	_, ok := outputMetrics["job:duration:total:seconds"]
 	if !ok {
-		return nil, fmt.Errorf("job not indexed, does not have metric %q", "job:duration:total:seconds")
+		// we don't want to retry so log the error but return nil
+		logwithctx(ctx).Errorf("job not indexed, does not have metric %q", "job:duration:total:seconds")
+		return nil, nil
 	}
 
 	return outputMetrics, nil
