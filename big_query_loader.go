@@ -8,6 +8,7 @@ import (
 	"google.golang.org/api/googleapi"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -15,7 +16,9 @@ const DataPartitioningField = "PartitionTime"
 const JobRunNameField = "JobRunName"
 const SourceNameField = "Source"
 const internalWriteLog = "internal_write_log"
+const modifiedTime = "ModifiedTime"
 const internalWriteLogCompleted = "Completed"
+const maxRetries = 5
 
 type BigQueryLoader struct {
 	ProjectID  string
@@ -58,7 +61,7 @@ func (b *BigQueryLoader) Init(ctx context.Context) error {
 	dataInstance := DataInstance{CreationTime: time.Now(), JobRunName: "startup", Source: "internal"}
 	dataFile := DataFile{
 		TableName: internalWriteLog,
-		Schema:    map[string]DataType{internalWriteLogCompleted: DataTypeBool},
+		Schema:    map[string]DataType{internalWriteLogCompleted: DataTypeBool, modifiedTime: DataTypeTimestamp},
 		ChunkSize: 1000,
 	}
 
@@ -467,6 +470,10 @@ func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataIns
 		return nil, fmt.Errorf("missing creation time")
 	}
 
+	if dataInstance.CreationTime.Before(time.Now().Add(-12 * time.Hour)) {
+		logwithctx(ctx).Warnf("Detected event processing lag with event creation time of %s", dataInstance.CreationTime.Format(time.RFC3339))
+	}
+
 	// https://cloud.google.com/bigquery/docs/sessions-intro
 	// https://cloud.google.com/bigquery/docs/transactions
 	// could look at using sessions and transactions
@@ -485,20 +492,8 @@ func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataIns
 		inserter = tableCache.table.Inserter()
 
 		// create an entry in the write log table
-		q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s) VALUES('%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), "false"))
-		job, err := q.Run(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("error creating write log entry %v", err)
-		}
-
-		status, err := job.Wait(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("error inserting write log entry %v", err)
-		}
-
-		if !status.Done() {
-			return nil, fmt.Errorf("error completing write log insert job")
-		}
+		q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "false"))
+		runQueryWithBackoff(ctx, q, "create write log entry")
 	}
 
 	diRows := make([]interface{}, 0)
@@ -527,22 +522,49 @@ func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataIns
 
 	// mark our write log entry complete
 	// we won't return errors here but will log warnings
-	q := b.Client.Query(fmt.Sprintf("UPDATE %s.%s SET %s = %s WHERE %s = '%s' AND %s = '%s' AND %s = TIMESTAMP('%s')", b.DataSetID, internalWriteLog, internalWriteLogCompleted, "true", JobRunNameField, dataInstance.JobRunName, SourceNameField, dataInstance.Source, DataPartitioningField, dataInstance.CreationTime.Format(time.RFC3339)))
-	job, err := q.Run(ctx)
-	if err != nil {
-		logwithctx(ctx).Warnf(fmt.Sprintf("error completing write log entry %v", err))
-	}
-
-	status, err := job.Wait(ctx)
-	if err != nil {
-		logwithctx(ctx).Warnf(fmt.Sprintf("error updating write log entry completion %v", err))
-	}
-
-	if !status.Done() {
-		logwithctx(ctx).Warnf(fmt.Sprintf("error completing write log completion job"))
-	}
-
+	q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "true"))
+	runQueryWithBackoff(ctx, q, "update write log completion")
 	return nil, nil
+}
+
+func runQueryWithBackoff(ctx context.Context, q *bigquery.Query, action string) error {
+	retries := 0
+	for {
+		logwithctx(ctx).Infof("Attempting query for %s, retries: %d", action, retries)
+		evaluateRetry := false
+		job, err := q.Run(ctx)
+		if err != nil {
+			if !strings.Contains("jobRateLimitExceeded", err.Error()) {
+				evaluateRetry = true
+			} else {
+				logwithctx(ctx).Warnf(fmt.Sprintf("error running %s:  %v", action, err))
+				return err
+			}
+		}
+
+		status, err := job.Wait(ctx)
+		if err != nil {
+			if !strings.Contains("jobRateLimitExceeded", err.Error()) {
+				evaluateRetry = true
+			} else {
+				logwithctx(ctx).Warnf(fmt.Sprintf("error waiting for %s: %v", action, err))
+				return err
+			}
+		} else if !status.Done() {
+			logwithctx(ctx).Warnf(fmt.Sprintf("error status not done for %s", action))
+		}
+
+		if !evaluateRetry || retries >= maxRetries {
+			if evaluateRetry {
+				logwithctx(ctx).Warnf(fmt.Sprintf("error exhausted retries %s: %v", action, err))
+			}
+
+			return err
+		}
+
+		retries++
+		time.Sleep(time.Millisecond * time.Duration(retries) * 500)
+	}
 }
 
 func insertRows(ctx context.Context, inserter *bigquery.Inserter, items []interface{}) {

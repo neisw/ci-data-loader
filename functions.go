@@ -168,6 +168,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	jobRunData, err := generateJobRunDataEvent(&e)
 
 	if err != nil {
+		logrus.Errorf("Returning generateJobRunDataEvent error for %v", e)
 		return err
 	}
 
@@ -179,6 +180,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	err = jobRunData.parseJob(prJobsEnabled)
 	if err != nil {
+		logrus.Errorf("Returning parseJob error for %v", e)
 		return err
 	}
 
@@ -201,7 +203,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		simpleUploader, err = generateDataFileUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "autodl"
 
-	case strings.HasPrefix(jobRunData.Filename, "e2e-events"):
+	case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
 		simpleUploader, err = generateIntervalUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "intervals"
 
@@ -209,9 +211,11 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return nil
 	}
 
+	// no point returning error if we can't process it
+	// see cases where a bad file is continually reprocessed
 	if err != nil {
-		logwithctx(ctx).Errorf("Failed to initialize simple loader: %v", err)
-		return err
+		logwithctx(ctx).Errorf("Failed to initialize simple loader: %v - %v", err, e)
+		return nil
 	}
 
 	startTime := time.Now()
