@@ -6,9 +6,10 @@ deploy: build
 	gcloud functions deploy LoadJobRunData \
 		--project openshift-gce-devel --retry --runtime go121 \
 		--service-account job-run-big-query-writer@openshift-gce-devel.iam.gserviceaccount.com \
-		--memory 2048MB --timeout=300s --max-instances=20 \
+		--memory 2048MB --timeout=300s --max-instances=40 \
 		--trigger-resource test-platform-results --trigger-event google.storage.object.finalize \
 		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl \
+		--no-gen2 \
 		--docker-registry=artifact-registry
 .PHONY: deploy
 
@@ -19,6 +20,7 @@ deploy-test: build
 		--memory 2048MB --timeout=300s --max-instances=10 \
 		--trigger-resource test-platform-results --trigger-event google.storage.object.finalize \
 		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl_test \
+		--no-gen2 \
 		--docker-registry=artifact-registry
 .PHONY: deploy-test
 
