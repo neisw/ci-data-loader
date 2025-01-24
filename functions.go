@@ -281,8 +281,19 @@ func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
 		baseIndex := 3
 		padding := 0
 		// try to detect if the 4 index is numeric, if not bump it out 1
+
+		if len(parts) < 5 {
+			logrus.Infof("Unexpected job path for parsing build id from pr-logs job:  %s", j.GCSEvent.Name)
+			return nil
+		}
 		if !buildIdMatch.MatchString(parts[baseIndex+padding+1]) {
-			padding += 1
+			if len(parts) > 5 {
+				padding += 1
+			} else {
+				logrus.Infof("failed to parse build id for pr-logs job:  %s", j.GCSEvent.Name)
+				return nil
+			}
+
 		}
 
 		job = parts[baseIndex+padding]
