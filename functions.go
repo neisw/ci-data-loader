@@ -203,9 +203,10 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		simpleUploader, err = generateDataFileUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "autodl"
 
-	case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
-		simpleUploader, err = generateIntervalUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
-		dataType = "intervals"
+	// disabling e2e-events support due to lack of usage, size of data and potential memory impacts on CF
+	//case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
+	//	simpleUploader, err = generateIntervalUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+	//	dataType = "intervals"
 
 	default:
 		return nil
