@@ -27,6 +27,7 @@ type DataFile struct {
 	Schema          map[string]DataType `json:"schema"`
 	SchemaMapping   map[string]string   `json:"schema_mapping"`
 	Rows            []map[string]string `json:"rows"`
+	ComplexRows     []interface{}       `json:"complex_rows"`
 	ExpirationDays  int                 `json:"expiration_days"`
 	PartitionColumn string              `json:"partition_column"`
 	PartitionType   string              `json:"partition_type"`
@@ -34,10 +35,11 @@ type DataFile struct {
 }
 
 type DataInstance struct {
-	Source       string
-	CreationTime time.Time
-	JobRunName   string
-	DataFile     *DataFile
+	Source                 string
+	CreationTime           time.Time
+	JobRunName             string
+	DataFile               *DataFile
+	SkipMetaDataValidation bool
 }
 
 func generateDataFileUploader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader DataLoader) (SimpleUploader, error) {
