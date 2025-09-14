@@ -5,6 +5,7 @@ import (
 	"cloud.google.com/go/storage"
 	"context"
 	"fmt"
+	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/api/option"
 	"os"
@@ -54,15 +55,18 @@ const (
 	ProjectIdEnv          = "PROJECT_ID"
 	PRJobsEnabledEnv      = "PR_JOBS_ENABLED"      // local testing only
 	GCSCredentialsFileEnv = "GCS_CREDENTIALS_FILE" // local testing only
+	LoadIntervalsOnly     = "LOAD_INTERVALS_ONLY"
 )
 
 var clientsCache *ClientsCache
 var buildIdMatch = regexp.MustCompile(`^\d`)
 
 type ClientsCache struct {
-	storageClient  *storage.Client
-	bigQueryLoader *BigQueryLoader
-	cachedTime     time.Time
+	storageClient     *storage.Client
+	bigQueryLoader    *BigQueryLoader
+	cachedTime        time.Time
+	prJobsEnabled     bool
+	loadIntervalsOnly bool
 }
 
 func init() {
@@ -141,12 +145,26 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 		return nil, err
 	}
 
+	prJobsEnabledFlag := os.Getenv(PRJobsEnabledEnv)
+	if len(prJobsEnabledFlag) > 0 && prJobsEnabledFlag == "Y" {
+		newCache.prJobsEnabled = true
+	}
+
+	loadIntervalsOnlyFlag := os.Getenv(LoadIntervalsOnly)
+	if len(loadIntervalsOnlyFlag) > 0 && loadIntervalsOnlyFlag == "Y" {
+		newCache.loadIntervalsOnly = true
+	}
+
 	// Technically we will leak connections since we
 	// initialize these globally and don't know when our CF will close
 	// but this is a trade-off for the 'warm start' and shouldn't be an issue
 	// defer storageClient.Close()
 
 	return &newCache, nil
+}
+
+func LoadJobRunDataTestIntervals(ctx context.Context, e GCSEvent) error {
+	return LoadJobRunData(ctx, e)
 }
 
 func LoadJobRunDataTest(ctx context.Context, e GCSEvent) error {
@@ -157,6 +175,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	var simpleUploader SimpleUploader
 	var err error
+	startTime := time.Now()
 
 	// initially added when our SA was deleted
 	// may not be needed but if we are long running then
@@ -172,13 +191,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return err
 	}
 
-	prJobsEnabled := false
-	prJobsEnabledFlag := os.Getenv(PRJobsEnabledEnv)
-	if len(prJobsEnabledFlag) > 0 && prJobsEnabledFlag == "Y" {
-		prJobsEnabled = true
-	}
-
-	err = jobRunData.parseJob(prJobsEnabled)
+	err = jobRunData.parseJob(clientsCache.prJobsEnabled)
 	if err != nil {
 		logrus.Errorf("Returning parseJob error for %v", e)
 		return err
@@ -195,6 +208,13 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	switch {
 
+	case clientsCache.loadIntervalsOnly:
+		// enabling e2e-events support as separate CF only due to size of data and potential memory impacts on CF
+		if strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json") {
+			err = generateComplexIntervalLoader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+			dataType = "intervals"
+		}
+
 	case "job_metrics.json" == jobRunData.Filename:
 		simpleUploader, err = generateMetricsUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "metrics"
@@ -202,11 +222,6 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	case strings.HasSuffix(jobRunData.Filename, AutoDataLoaderSuffix):
 		simpleUploader, err = generateDataFileUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "autodl"
-
-	// disabling e2e-events support due to lack of usage, size of data and potential memory impacts on CF
-	//case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
-	//	simpleUploader, err = generateIntervalUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
-	//	dataType = "intervals"
 
 	default:
 		return nil
@@ -219,12 +234,14 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return nil
 	}
 
-	startTime := time.Now()
-	err = simpleUploader.upload(ctx)
+	// intervals are handled separately so simpleUploader will be nil
+	if simpleUploader != nil {
+		err = simpleUploader.upload(ctx)
 
-	if err != nil {
-		logwithctx(ctx).Errorf("Failed to upload loader: %v", err)
-		return err
+		if err != nil {
+			logwithctx(ctx).Errorf("Failed to upload loader: %v", err)
+			return err
+		}
 	}
 
 	diff := int64(time.Now().Sub(startTime) / time.Millisecond)
