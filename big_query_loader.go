@@ -558,6 +558,72 @@ func (b *BigQueryLoader) LoadComplexDataItems(ctx context.Context, dataInstance 
 	return nil, nil
 }
 
+func (b *BigQueryLoader) InitializeStreamingComplexDataItems(ctx context.Context, dataInstance DataInstance) error {
+
+	// JobRunName and CreationTime are required
+	if len(dataInstance.JobRunName) == 0 {
+		return fmt.Errorf("missing Job run name")
+	}
+
+	if dataInstance.CreationTime.IsZero() {
+		return fmt.Errorf("missing creation time")
+	}
+
+	if dataInstance.CreationTime.Before(time.Now().Add(-12 * time.Hour)) {
+		logwithctx(ctx).Warnf("Detected event processing lag with event creation time of %s", dataInstance.CreationTime.Format(time.RFC3339))
+	}
+
+	metaData := bigquery.TableMetadata{Name: dataInstance.DataFile.TableName}
+	err := b.retryableTableCache(ctx, &metaData)
+	if err != nil {
+		return fmt.Errorf("failed to initialize table cache")
+	}
+
+	// https://cloud.google.com/bigquery/docs/sessions-intro
+	// https://cloud.google.com/bigquery/docs/transactions
+	// could look at using sessions and transactions
+	// for now just use a 3 part sequence to capture
+	// we attempted to write the data
+	// the data is written
+	// we succeeded in writing the data
+
+	if !b.DryRun {
+		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
+
+		if !ok || tableCache.table == nil {
+			return fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
+		}
+
+		// create an entry in the write log table
+		q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "false"))
+		runQueryWithBackoff(ctx, q, "create write log entry")
+	}
+
+	return nil
+}
+
+func (b *BigQueryLoader) LoadStreamingComplexDataItems(ctx context.Context, dataInstance DataInstance, diRows []interface{}) error {
+
+	var inserter *bigquery.Inserter
+	if !b.DryRun {
+		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
+
+		if !ok || tableCache.table == nil {
+			return fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
+		}
+		inserter = tableCache.table.Inserter()
+		insertRows(ctx, inserter, diRows)
+	}
+	return nil
+}
+
+func (b *BigQueryLoader) FinalizeStreamingComplexDataItems(ctx context.Context, dataInstance DataInstance) {
+	// mark our write log entry complete
+	// we won't return errors here but will log warnings
+	q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "true"))
+	runQueryWithBackoff(ctx, q, "update write log completion")
+}
+
 func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataInstance) ([]interface{}, error) {
 
 	// JobRunName and CreationTime are required

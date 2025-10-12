@@ -178,7 +178,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	startTime := time.Now()
 
 	// initially added when our SA was deleted
-	// may not be needed but if we are long running then
+	// may not be needed but if we are long-running then
 	// periodically refresh our clients
 	if clientsCache == nil || clientsCache.cachedTime.Before(time.Now().Add(-24*time.Hour)) {
 		initClientCache()
@@ -211,7 +211,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	case clientsCache.loadIntervalsOnly:
 		// enabling e2e-events support as separate CF only due to size of data and potential memory impacts on CF
 		if strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json") {
-			err = generateComplexIntervalLoader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+			err = generateStreamingComplexIntervalLoader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 			dataType = "intervals"
 		}
 

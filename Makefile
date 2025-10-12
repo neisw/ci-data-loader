@@ -28,7 +28,7 @@ deploy-test-intervals: build
 	gcloud functions deploy LoadJobRunDataTestIntervals \
 		--project openshift-gce-devel --runtime go121 \
 		--service-account job-run-big-query-writer@openshift-gce-devel.iam.gserviceaccount.com \
-		--memory 8192MB --timeout=300s --max-instances=1000 \
+		--memory 8192MB --timeout=300s --max-instances=100 \
 		--trigger-resource test-platform-results --trigger-event google.storage.object.finalize \
 		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl_test,PR_JOBS_ENABLED=N,LOAD_INTERVALS_ONLY=Y \
 		--no-gen2 \
@@ -54,3 +54,8 @@ delete-test:
 	gcloud functions delete LoadJobRunDataTest \
 		--project openshift-gce-devel
 .PHONY: delete-test
+
+delete-test-intervals:
+	gcloud functions delete LoadJobRunDataTestIntervals \
+		--project openshift-gce-devel
+.PHONY: delete-test-intervals
