@@ -94,7 +94,7 @@ func (b *BigQueryLoader) validateBQTable(ctx context.Context, expectedMetaData *
 	// if it is a client error we will retry
 	var validationErr error
 	err := wait.ExponentialBackoff(backoff, func() (done bool, err error) {
-		validationErr = b.retryableTableValidation(ctx, expectedMetaData)
+		validationErr = b.retryableTableValidation(ctx, expectedMetaData, false)
 
 		if validationErr != nil {
 			if cerr, ok := err.(*ClientError); ok {
@@ -110,7 +110,7 @@ func (b *BigQueryLoader) validateBQTable(ctx context.Context, expectedMetaData *
 
 	return nil
 }
-func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedMetaData *bigquery.TableMetadata) error {
+func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedMetaData *bigquery.TableMetadata, skipValidateMetadata bool) error {
 	dataSet := b.Client.Dataset(b.DataSetID)
 
 	if dataSet == nil {
@@ -130,7 +130,7 @@ func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedM
 	if ok {
 		// if we cached the table more than an hour ago let it fall through
 		// so we look it up again
-		if cachedTable.table != nil && cachedTable.metaData != nil && cachedTable.cacheTime.After(time.Now().Add(-1*time.Hour)) {
+		if !skipValidateMetadata && cachedTable.table != nil && cachedTable.metaData != nil && cachedTable.cacheTime.After(time.Now().Add(-1*time.Hour)) {
 			hasUpdate, err := b.validateTableMetadata(ctx, expectedMetaData, cachedTable.metaData, cachedTable.table, true)
 			if err != nil {
 				return err
@@ -160,20 +160,22 @@ func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedM
 		return err
 	}
 
-	hasUpdate, err := b.validateTableMetadata(ctx, expectedMetaData, existingMetaData, table, false)
-
-	if err != nil {
-		return err
-	}
-
-	if hasUpdate {
-		// get the current metadata
-		// we have to look it up again if we
-		// just changed it
-		existingMetaData, err = table.Metadata(ctx)
+	if !skipValidateMetadata {
+		hasUpdate, err := b.validateTableMetadata(ctx, expectedMetaData, existingMetaData, table, false)
 
 		if err != nil {
 			return err
+		}
+
+		if hasUpdate {
+			// get the current metadata
+			// we have to look it up again if we
+			// just changed it
+			existingMetaData, err = table.Metadata(ctx)
+
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -182,6 +184,29 @@ func (b *BigQueryLoader) retryableTableValidation(ctx context.Context, expectedM
 	b.tableCache[expectedMetaData.Name] = cachedTable
 
 	return nil
+}
+
+func (b *BigQueryLoader) retryableTableCache(ctx context.Context, expectedMetaData *bigquery.TableMetadata) error {
+
+	// if it is a client error we will retry
+	var validationErr error
+	err := wait.ExponentialBackoff(backoff, func() (done bool, err error) {
+		validationErr = b.retryableTableValidation(ctx, expectedMetaData, true)
+
+		if validationErr != nil {
+			if cerr, ok := err.(*ClientError); ok {
+				return false, cerr
+			}
+		}
+		return true, validationErr
+	})
+
+	if err != nil {
+		return validationErr
+	}
+
+	return nil
+
 }
 
 func (b *BigQueryLoader) createTable(ctx context.Context, expectedMetaData *bigquery.TableMetadata, table *bigquery.Table) error {
@@ -459,6 +484,146 @@ func (b *BigQueryLoader) getBQSchema(di DataInstance, schema bigquery.Schema) bi
 	return schema
 }
 
+func (b *BigQueryLoader) LoadComplexDataItems(ctx context.Context, dataInstance DataInstance) ([]interface{}, error) {
+
+	// JobRunName and CreationTime are required
+	if len(dataInstance.JobRunName) == 0 {
+		return nil, fmt.Errorf("missing Job run name")
+	}
+
+	if dataInstance.CreationTime.IsZero() {
+		return nil, fmt.Errorf("missing creation time")
+	}
+
+	if dataInstance.CreationTime.Before(time.Now().Add(-12 * time.Hour)) {
+		logwithctx(ctx).Warnf("Detected event processing lag with event creation time of %s", dataInstance.CreationTime.Format(time.RFC3339))
+	}
+
+	metaData := bigquery.TableMetadata{Name: dataInstance.DataFile.TableName}
+	err := b.retryableTableCache(ctx, &metaData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize table cache")
+	}
+
+	// https://cloud.google.com/bigquery/docs/sessions-intro
+	// https://cloud.google.com/bigquery/docs/transactions
+	// could look at using sessions and transactions
+	// for now just use a 3 part sequence to capture
+	// we attempted to write the data
+	// the data is written
+	// we succeeded in writing the data
+
+	var inserter *bigquery.Inserter
+	if !b.DryRun {
+		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
+
+		if !ok || tableCache.table == nil {
+			return nil, fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
+		}
+		inserter = tableCache.table.Inserter()
+
+		// create an entry in the write log table
+		q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "false"))
+		runQueryWithBackoff(ctx, q, "create write log entry")
+	}
+
+	diRows := make([]interface{}, 0)
+
+	chunkSize := dataInstance.DataFile.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 999
+	}
+	for _, r := range dataInstance.DataFile.ComplexRows {
+
+		diRows = append(diRows, r)
+
+		if len(diRows) > chunkSize {
+			if inserter != nil {
+				insertRows(ctx, inserter, diRows)
+				diRows = make([]interface{}, 0)
+			}
+		}
+	}
+
+	if len(diRows) > 0 && inserter != nil {
+		insertRows(ctx, inserter, diRows)
+	} else {
+		return diRows, nil
+	}
+
+	// mark our write log entry complete
+	// we won't return errors here but will log warnings
+	q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "true"))
+	runQueryWithBackoff(ctx, q, "update write log completion")
+	return nil, nil
+}
+
+func (b *BigQueryLoader) InitializeStreamingComplexDataItems(ctx context.Context, dataInstance DataInstance) error {
+
+	// JobRunName and CreationTime are required
+	if len(dataInstance.JobRunName) == 0 {
+		return fmt.Errorf("missing Job run name")
+	}
+
+	if dataInstance.CreationTime.IsZero() {
+		return fmt.Errorf("missing creation time")
+	}
+
+	if dataInstance.CreationTime.Before(time.Now().Add(-12 * time.Hour)) {
+		logwithctx(ctx).Warnf("Detected event processing lag with event creation time of %s", dataInstance.CreationTime.Format(time.RFC3339))
+	}
+
+	metaData := bigquery.TableMetadata{Name: dataInstance.DataFile.TableName}
+	err := b.retryableTableCache(ctx, &metaData)
+	if err != nil {
+		return fmt.Errorf("failed to initialize table cache")
+	}
+
+	// https://cloud.google.com/bigquery/docs/sessions-intro
+	// https://cloud.google.com/bigquery/docs/transactions
+	// could look at using sessions and transactions
+	// for now just use a 3 part sequence to capture
+	// we attempted to write the data
+	// the data is written
+	// we succeeded in writing the data
+
+	if !b.DryRun {
+		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
+
+		if !ok || tableCache.table == nil {
+			return fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
+		}
+
+		// create an entry in the write log table
+		q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "false"))
+		runQueryWithBackoff(ctx, q, "create write log entry")
+	}
+
+	return nil
+}
+
+func (b *BigQueryLoader) LoadStreamingComplexDataItems(ctx context.Context, dataInstance DataInstance, diRows []interface{}) error {
+
+	var inserter *bigquery.Inserter
+	if !b.DryRun {
+		tableCache, ok := b.tableCache[dataInstance.DataFile.TableName]
+
+		if !ok || tableCache.table == nil {
+			return fmt.Errorf("invalid table reference for %s", dataInstance.DataFile.TableName)
+		}
+		inserter = tableCache.table.Inserter()
+		insertRows(ctx, inserter, diRows)
+	}
+	return nil
+}
+
+func (b *BigQueryLoader) FinalizeStreamingComplexDataItems(ctx context.Context, dataInstance DataInstance) {
+	// mark our write log entry complete
+	// we won't return errors here but will log warnings
+	q := b.Client.Query(fmt.Sprintf("INSERT INTO %s.%s (%s, %s, %s, %s, %s) VALUES('%s', '%s', '%s', '%s', %s)", b.DataSetID, internalWriteLog, JobRunNameField, SourceNameField, DataPartitioningField, modifiedTime, internalWriteLogCompleted, dataInstance.JobRunName, dataInstance.Source, dataInstance.CreationTime.Format(time.RFC3339), time.Now().Format(time.RFC3339), "true"))
+	runQueryWithBackoff(ctx, q, "update write log completion")
+}
+
 func (b *BigQueryLoader) LoadDataItems(ctx context.Context, dataInstance DataInstance) ([]interface{}, error) {
 
 	// JobRunName and CreationTime are required
@@ -542,16 +707,18 @@ func runQueryWithBackoff(ctx context.Context, q *bigquery.Query, action string) 
 			}
 		}
 
-		status, err := job.Wait(ctx)
-		if err != nil {
-			if !strings.Contains("jobRateLimitExceeded", err.Error()) {
-				evaluateRetry = true
-			} else {
-				logwithctx(ctx).Warnf(fmt.Sprintf("error waiting for %s: %v", action, err))
-				return err
+		if job != nil {
+			status, err := job.Wait(ctx)
+			if err != nil {
+				if !strings.Contains("jobRateLimitExceeded", err.Error()) {
+					evaluateRetry = true
+				} else {
+					logwithctx(ctx).Warnf(fmt.Sprintf("error waiting for %s: %v", action, err))
+					return err
+				}
+			} else if !status.Done() {
+				logwithctx(ctx).Warnf(fmt.Sprintf("error status not done for %s", action))
 			}
-		} else if !status.Done() {
-			logwithctx(ctx).Warnf(fmt.Sprintf("error status not done for %s", action))
 		}
 
 		if !evaluateRetry || retries >= maxRetries {

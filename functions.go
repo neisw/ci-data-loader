@@ -5,6 +5,7 @@ import (
 	"cloud.google.com/go/storage"
 	"context"
 	"fmt"
+	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/api/option"
 	"os"
@@ -52,8 +53,8 @@ const (
 	AutoDataLoaderSuffix  = "autodl.json"
 	DataSetEnv            = "DATASET_ID"
 	ProjectIdEnv          = "PROJECT_ID"
-	PRJobsEnabledEnv      = "PR_JOBS_ENABLED"      // local testing only
 	GCSCredentialsFileEnv = "GCS_CREDENTIALS_FILE" // local testing only
+	PRDataFiles           = "PR_DATA_FILES"
 )
 
 var clientsCache *ClientsCache
@@ -63,6 +64,8 @@ type ClientsCache struct {
 	storageClient  *storage.Client
 	bigQueryLoader *BigQueryLoader
 	cachedTime     time.Time
+	prJobsEnabled  bool
+	prDataFiles    []string
 }
 
 func init() {
@@ -141,6 +144,15 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 		return nil, err
 	}
 
+	prDataFiles := os.Getenv(PRDataFiles)
+	if len(prDataFiles) > 0 {
+		// use : as a delimiter
+		dataFiles := strings.Split(prDataFiles, ":")
+		if len(dataFiles) > 0 {
+			newCache.prDataFiles = dataFiles
+		}
+	}
+
 	// Technically we will leak connections since we
 	// initialize these globally and don't know when our CF will close
 	// but this is a trade-off for the 'warm start' and shouldn't be an issue
@@ -157,9 +169,10 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	var simpleUploader SimpleUploader
 	var err error
+	startTime := time.Now()
 
 	// initially added when our SA was deleted
-	// may not be needed but if we are long running then
+	// may not be needed but if we are long-running then
 	// periodically refresh our clients
 	if clientsCache == nil || clientsCache.cachedTime.Before(time.Now().Add(-24*time.Hour)) {
 		initClientCache()
@@ -172,13 +185,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return err
 	}
 
-	prJobsEnabled := false
-	prJobsEnabledFlag := os.Getenv(PRJobsEnabledEnv)
-	if len(prJobsEnabledFlag) > 0 && prJobsEnabledFlag == "Y" {
-		prJobsEnabled = true
-	}
-
-	err = jobRunData.parseJob(prJobsEnabled)
+	err = jobRunData.parseJob(clientsCache.prDataFiles)
 	if err != nil {
 		logrus.Errorf("Returning parseJob error for %v", e)
 		return err
@@ -186,6 +193,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	if len(jobRunData.BuildID) == 0 || len(jobRunData.Job) == 0 || len(jobRunData.Filename) == 0 {
 		logrus.Debugf("Skipping event for: %v", e)
+		return nil
 	}
 
 	ctx = addlogctx(ctx, jobRunData.BuildID, jobRunData.Job, jobRunData.Filename)
@@ -195,6 +203,11 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	switch {
 
+	case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
+		// Streaming loader won't return a SimpleUploader object since it handles the loading as it processes the data
+		err = generateStreamingComplexIntervalLoader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+		dataType = "intervals"
+
 	case "job_metrics.json" == jobRunData.Filename:
 		simpleUploader, err = generateMetricsUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "metrics"
@@ -202,11 +215,6 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	case strings.HasSuffix(jobRunData.Filename, AutoDataLoaderSuffix):
 		simpleUploader, err = generateDataFileUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
 		dataType = "autodl"
-
-	// disabling e2e-events support due to lack of usage, size of data and potential memory impacts on CF
-	//case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
-	//	simpleUploader, err = generateIntervalUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
-	//	dataType = "intervals"
 
 	default:
 		return nil
@@ -219,12 +227,14 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return nil
 	}
 
-	startTime := time.Now()
-	err = simpleUploader.upload(ctx)
+	// intervals are handled separately so simpleUploader will be nil
+	if simpleUploader != nil {
+		err = simpleUploader.upload(ctx)
 
-	if err != nil {
-		logwithctx(ctx).Errorf("Failed to upload loader: %v", err)
-		return err
+		if err != nil {
+			logwithctx(ctx).Errorf("Failed to upload loader: %v", err)
+			return err
+		}
 	}
 
 	diff := int64(time.Now().Sub(startTime) / time.Millisecond)
@@ -247,7 +257,7 @@ func generateJobRunDataEvent(event *GCSEvent) (*JobRunDataEvent, error) {
 	return &JobRunDataEvent{GCSEvent: event}, nil
 }
 
-func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
+func (j *JobRunDataEvent) parseJob(prDataFiles []string) error {
 	if j.GCSEvent == nil {
 		return fmt.Errorf("invalid GCSEvent")
 	}
@@ -273,9 +283,16 @@ func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
 			return nil
 		}
 	case parts[0] == "pr-logs":
-		// we want to collect risk-analysis artifacts for pr jobs
+		// we want to collect limited artifacts for pr jobs
 		fileNameBase := path.Base(j.GCSEvent.Name)
-		if !prJobsEnabled && !strings.HasPrefix(fileNameBase, "risk-analysis-") {
+		collectPrArtifacts := false
+		for _, prefix := range prDataFiles {
+			if strings.HasPrefix(fileNameBase, prefix) {
+				collectPrArtifacts = true
+				break
+			}
+		}
+		if !collectPrArtifacts {
 			return nil
 		}
 		// pr-logs/pull/28431/pull-ci-openshift-origin-master-e2e-gcp-ovn-upgrade/1730318696951320576

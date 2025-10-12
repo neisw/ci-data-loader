@@ -1,0 +1,72 @@
+{
+    "items": [
+        {
+            "level": "Info",
+            "source": "MachineMonitor",
+            "display": true,
+            "locator": {
+                "type": "Machine",
+                "keys": {
+                    "machine": "ci-op-967bnim5-46810-j5f89-master-0"
+                }
+            },
+            "message": {
+                "reason": "MachinePhase",
+                "cause": "",
+                "humanMessage": "Machine is in \"\u003cmissing\u003e\"",
+                "annotations": {
+                    "constructed": "machine-lifecycle-constructor",
+                    "node": "ci-op-967bnim5-46810-j5f89-master-0",
+                    "phase": "\u003cmissing\u003e",
+                    "reason": "MachinePhase"
+                }
+            },
+            "from": "2025-08-20T09:51:48Z",
+            "to": "2025-08-20T12:18:04Z"
+        },
+        {
+            "level": "Info",
+            "source": "MachineMonitor",
+            "display": true,
+            "locator": {
+                "type": "Machine",
+                "keys": {
+                    "machine": "ci-op-967bnim5-46810-j5f89-master-1"
+                }
+            },
+            "message": {
+                "reason": "MachinePhase",
+                "cause": "",
+                "humanMessage": "Machine is in \"\u003cmissing\u003e\"",
+                "annotations": {
+                    "constructed": "machine-lifecycle-constructor",
+                    "node": "ci-op-967bnim5-46810-j5f89-master-1",
+                    "phase": "\u003cmissing\u003e",
+                    "reason": "MachinePhase"
+                }
+            },
+            "from": "2025-08-20T09:51:48Z",
+            "to": "2025-08-20T12:18:04Z"
+        },
+        {
+            "level": "Info",
+            "source": "MachineMonitor",
+            "locator": {
+                "type": "Machine",
+                "keys": {
+                    "machine": "ci-op-967bnim5-46810-j5f89-master-2"
+                }
+            },
+            "message": {
+                "reason": "MachineCreated",
+                "cause": "",
+                "humanMessage": "Machine created",
+                "annotations": {
+                    "reason": "MachineCreated"
+                }
+            },
+            "from": "2025-08-20T09:51:49Z",
+            "to": "2025-08-20T09:51:49Z"
+        }
+    ]
+}
