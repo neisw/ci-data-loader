@@ -53,20 +53,19 @@ const (
 	AutoDataLoaderSuffix  = "autodl.json"
 	DataSetEnv            = "DATASET_ID"
 	ProjectIdEnv          = "PROJECT_ID"
-	PRJobsEnabledEnv      = "PR_JOBS_ENABLED"      // local testing only
 	GCSCredentialsFileEnv = "GCS_CREDENTIALS_FILE" // local testing only
-	LoadIntervalsOnly     = "LOAD_INTERVALS_ONLY"
+	PRDataFiles           = "PR_DATA_FILES"
 )
 
 var clientsCache *ClientsCache
 var buildIdMatch = regexp.MustCompile(`^\d`)
 
 type ClientsCache struct {
-	storageClient     *storage.Client
-	bigQueryLoader    *BigQueryLoader
-	cachedTime        time.Time
-	prJobsEnabled     bool
-	loadIntervalsOnly bool
+	storageClient  *storage.Client
+	bigQueryLoader *BigQueryLoader
+	cachedTime     time.Time
+	prJobsEnabled  bool
+	prDataFiles    []string
 }
 
 func init() {
@@ -145,14 +144,13 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 		return nil, err
 	}
 
-	prJobsEnabledFlag := os.Getenv(PRJobsEnabledEnv)
-	if len(prJobsEnabledFlag) > 0 && prJobsEnabledFlag == "Y" {
-		newCache.prJobsEnabled = true
-	}
-
-	loadIntervalsOnlyFlag := os.Getenv(LoadIntervalsOnly)
-	if len(loadIntervalsOnlyFlag) > 0 && loadIntervalsOnlyFlag == "Y" {
-		newCache.loadIntervalsOnly = true
+	prDataFiles := os.Getenv(PRDataFiles)
+	if len(prDataFiles) > 0 {
+		// use : as a delimiter
+		dataFiles := strings.Split(prDataFiles, ":")
+		if len(dataFiles) > 0 {
+			newCache.prDataFiles = dataFiles
+		}
 	}
 
 	// Technically we will leak connections since we
@@ -161,10 +159,6 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 	// defer storageClient.Close()
 
 	return &newCache, nil
-}
-
-func LoadJobRunDataTestIntervals(ctx context.Context, e GCSEvent) error {
-	return LoadJobRunData(ctx, e)
 }
 
 func LoadJobRunDataTest(ctx context.Context, e GCSEvent) error {
@@ -191,7 +185,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return err
 	}
 
-	err = jobRunData.parseJob(clientsCache.prJobsEnabled)
+	err = jobRunData.parseJob(clientsCache.prDataFiles)
 	if err != nil {
 		logrus.Errorf("Returning parseJob error for %v", e)
 		return err
@@ -199,6 +193,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	if len(jobRunData.BuildID) == 0 || len(jobRunData.Job) == 0 || len(jobRunData.Filename) == 0 {
 		logrus.Debugf("Skipping event for: %v", e)
+		return nil
 	}
 
 	ctx = addlogctx(ctx, jobRunData.BuildID, jobRunData.Job, jobRunData.Filename)
@@ -208,12 +203,10 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 
 	switch {
 
-	case clientsCache.loadIntervalsOnly:
-		// enabling e2e-events support as separate CF only due to size of data and potential memory impacts on CF
-		if strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json") {
-			err = generateStreamingComplexIntervalLoader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
-			dataType = "intervals"
-		}
+	case strings.HasPrefix(jobRunData.Filename, "e2e-events") && strings.HasSuffix(jobRunData.Filename, ".json"):
+		// Streaming loader won't return a SimpleUploader object since it handles the loading as it processes the data
+		err = generateStreamingComplexIntervalLoader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
+		dataType = "intervals"
 
 	case "job_metrics.json" == jobRunData.Filename:
 		simpleUploader, err = generateMetricsUploader(clientsCache.storageClient, ctx, jobRunData, clientsCache.bigQueryLoader)
@@ -264,7 +257,7 @@ func generateJobRunDataEvent(event *GCSEvent) (*JobRunDataEvent, error) {
 	return &JobRunDataEvent{GCSEvent: event}, nil
 }
 
-func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
+func (j *JobRunDataEvent) parseJob(prDataFiles []string) error {
 	if j.GCSEvent == nil {
 		return fmt.Errorf("invalid GCSEvent")
 	}
@@ -290,9 +283,16 @@ func (j *JobRunDataEvent) parseJob(prJobsEnabled bool) error {
 			return nil
 		}
 	case parts[0] == "pr-logs":
-		// we want to collect risk-analysis artifacts for pr jobs
+		// we want to collect limited artifacts for pr jobs
 		fileNameBase := path.Base(j.GCSEvent.Name)
-		if !prJobsEnabled && !strings.HasPrefix(fileNameBase, "risk-analysis-") {
+		collectPrArtifacts := false
+		for _, prefix := range prDataFiles {
+			if strings.HasPrefix(fileNameBase, prefix) {
+				collectPrArtifacts = true
+				break
+			}
+		}
+		if !collectPrArtifacts {
 			return nil
 		}
 		// pr-logs/pull/28431/pull-ci-openshift-origin-master-e2e-gcp-ovn-upgrade/1730318696951320576

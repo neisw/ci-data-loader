@@ -101,50 +101,6 @@ func (i *intervalLoader) getJSON(bytes []byte) (map[string]any, error) {
 	return result, nil
 }
 
-func generateComplexIntervalLoader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader *BigQueryLoader) error {
-
-	i := intervalLoader{}
-	if !event.GCSEvent.TimeCreated.IsZero() {
-		i.instanceTime = &event.GCSEvent.TimeCreated
-	}
-
-	i.source = event.Filename
-	i.jobRunName = event.BuildID
-	rows, err := i.parseComplexRows(client, ctx, event.GCSEvent.Bucket, event.GCSEvent.Name)
-	if err != nil {
-		return err
-	}
-
-	dataFile := DataFile{
-		TableName:       "e2e_intervals",
-		Schema:          nil,
-		SchemaMapping:   nil,
-		ComplexRows:     rows,
-		ExpirationDays:  0,
-		PartitionColumn: "from_time",
-		PartitionType:   "",
-		ChunkSize:       1000,
-	}
-	dataInstance := DataInstance{CreationTime: *i.instanceTime, JobRunName: event.BuildID, Source: event.Filename, DataFile: &dataFile}
-	existing, err := dataLoader.FindExistingData(ctx, dataInstance.CreationTime, dataFile.PartitionColumn, dataFile.TableName, dataInstance.JobRunName, dataInstance.Source)
-
-	if err != nil {
-		return err
-	} else if existing {
-		// we don't want duplicate data so if we have records already then log a warning and return nil so the function doesn't retry
-		logwithctx(ctx).Warnf("found existing data for %s/%s", dataInstance.JobRunName, dataInstance.Source)
-		return nil
-	}
-
-	_, err = dataLoader.LoadComplexDataItems(ctx, dataInstance)
-	if err != nil {
-		return err
-	}
-
-	return nil
-
-}
-
 func generateStreamingComplexIntervalLoader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader *BigQueryLoader) error {
 
 	i := intervalLoader{}
@@ -239,37 +195,6 @@ func (i *intervalLoader) streamComplexIntervalLoader(objectHandle *storage.Objec
 	}
 
 	return nil
-}
-
-func generateIntervalUploader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader DataLoader) (SimpleUploader, error) {
-	i := intervalLoader{}
-	if !event.GCSEvent.TimeCreated.IsZero() {
-		i.instanceTime = &event.GCSEvent.TimeCreated
-	}
-
-	rows, err := i.parseRows(client, ctx, event.GCSEvent.Bucket, event.GCSEvent.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	dataInstance := DataInstance{CreationTime: *i.instanceTime, JobRunName: event.BuildID, Source: event.Filename}
-	dataFile := DataFile{
-		TableName:       "e2e_intervals",
-		Schema:          map[string]DataType{"from_time": DataTypeTimestamp, "to_time": DataTypeTimestamp, "interval_json": DataTypeJSON},
-		SchemaMapping:   map[string]string{"from": "from_time", "to": "to_time", "interval": "interval_json"},
-		PartitionColumn: "from_time",
-		ChunkSize:       5000,
-		Rows:            rows,
-	}
-
-	dataInstance.DataFile = &dataFile
-
-	loader, err := generateDataUploader(dataInstance, dataLoader)
-	if err != nil {
-		return nil, err
-	}
-
-	return loader, nil
 }
 
 func (i *intervalLoader) parseComplexRows(client *storage.Client, ctx context.Context, bucket, name string) ([]interface{}, error) {
