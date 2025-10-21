@@ -6,6 +6,7 @@ require (
 	cloud.google.com/go/bigquery v1.64.0
 	cloud.google.com/go/storage v1.43.0
 	github.com/GoogleCloudPlatform/functions-framework-go v1.9.2
+	github.com/cloudevents/sdk-go/v2 v2.15.2
 	github.com/sirupsen/logrus v1.9.2
 	github.com/stretchr/testify v1.9.0
 	google.golang.org/api v0.214.0
@@ -20,7 +21,6 @@ require (
 	cloud.google.com/go/functions v1.19.3 // indirect
 	cloud.google.com/go/iam v1.2.2 // indirect
 	github.com/apache/arrow/go/v15 v15.0.2 // indirect
-	github.com/cloudevents/sdk-go/v2 v2.15.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect

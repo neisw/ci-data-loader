@@ -1,52 +1,47 @@
 package cidataloader
 
 import (
-	"cloud.google.com/go/bigquery"
-	"cloud.google.com/go/storage"
 	"context"
 	"fmt"
-	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
-	"github.com/sirupsen/logrus"
-	"google.golang.org/api/option"
 	"os"
 	"path"
 	"regexp"
 	"strings"
 	"time"
+
+	"cloud.google.com/go/bigquery"
+	"cloud.google.com/go/storage"
+	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
+	"github.com/cloudevents/sdk-go/v2/event"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/api/option"
 )
 
+// StorageObjectData contains metadata about a Cloud Storage object.
+type StorageObjectData struct {
+	Bucket      string            `json:"bucket"`
+	Name        string            `json:"name"`
+	Size        int64             `json:"size,string"`
+	ContentType string            `json:"contentType"`
+	TimeCreated time.Time         `json:"timeCreated"`
+	Updated     time.Time         `json:"updated"`
+	MD5Hash     string            `json:"md5Hash"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+// GCSEvent is kept for backward compatibility with existing code
 type GCSEvent struct {
-	Kind string `json:"kind"`
-	ID   string `json:"id"`
-	// SelfLink                string                 `json:"selfLink"`
-	Name   string `json:"name"`
-	Bucket string `json:"bucket"`
-	// Generation              string                 `json:"generation"`
-	// Metageneration          string                 `json:"metageneration"`
-	ContentType string    `json:"contentType"`
-	TimeCreated time.Time `json:"timeCreated"`
-	Updated     time.Time `json:"updated"`
-	// TemporaryHold           bool                   `json:"temporaryHold"`
-	// EventBasedHold          bool                   `json:"eventBasedHold"`
-	// RetentionExpirationTime time.Time              `json:"retentionExpirationTime"`
-	// StorageClass            string                 `json:"storageClass"`
-	// TimeStorageClassUpdated time.Time              `json:"timeStorageClassUpdated"`
-	Size      string `json:"size"`
-	MD5Hash   string `json:"md5Hash"`
-	MediaLink string `json:"mediaLink"`
-	// ContentEncoding         string                 `json:"contentEncoding"`
-	// ContentDisposition      string                 `json:"contentDisposition"`
-	// CacheControl            string                 `json:"cacheControl"`
-	Metadata map[string]interface{} `json:"metadata"`
-	// CRC32C                  string                 `json:"crc32c"`
-	// ComponentCount          int                    `json:"componentCount"`
-	// Etag                    string                 `json:"etag"`
-	// CustomerEncryption      struct {
-	// 	EncryptionAlgorithm string `json:"encryptionAlgorithm"`
-	// 	KeySha256           string `json:"keySha256"`
-	// }
-	// KMSKeyName    string `json:"kmsKeyName"`
-	// ResourceState string `json:"resourceState"`
+	Kind        string                 `json:"kind"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Bucket      string                 `json:"bucket"`
+	ContentType string                 `json:"contentType"`
+	TimeCreated time.Time              `json:"timeCreated"`
+	Updated     time.Time              `json:"updated"`
+	Size        string                 `json:"size"`
+	MD5Hash     string                 `json:"md5Hash"`
+	MediaLink   string                 `json:"mediaLink"`
+	Metadata    map[string]interface{} `json:"metadata"`
 }
 
 const (
@@ -72,6 +67,8 @@ type ClientsCache struct {
 
 func init() {
 	initClientCache()
+	// Register the CloudEvent function for gen2
+	// functions.CloudEvent("LoadJobRunData", loadJobRunDataCloudEvent)
 }
 
 func initClientCache() {
@@ -170,6 +167,39 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 	// defer storageClient.Close()
 
 	return &newCache, nil
+}
+
+// LoadJobRunDataCloudEvent is the CloudEvent handler for gen2 functions
+func LoadJobRunDataCloudEvent(ctx context.Context, e event.Event) error {
+	logrus.Infof("Event ID: %s", e.ID())
+	logrus.Infof("Event Type: %s", e.Type())
+
+	var data StorageObjectData
+	if err := e.DataAs(&data); err != nil {
+		logrus.Errorf("Failed to parse CloudEvent data: %v", err)
+		return fmt.Errorf("event.DataAs: %w", err)
+	}
+
+	// Convert StorageObjectData to GCSEvent for backward compatibility
+	gcsEvent := GCSEvent{
+		Kind:        "storage#object",
+		ID:          e.ID(),
+		Name:        data.Name,
+		Bucket:      data.Bucket,
+		ContentType: data.ContentType,
+		TimeCreated: data.TimeCreated,
+		Updated:     data.Updated,
+		Size:        fmt.Sprintf("%d", data.Size),
+		MD5Hash:     data.MD5Hash,
+		Metadata:    make(map[string]interface{}),
+	}
+
+	// Convert metadata from map[string]string to map[string]interface{}
+	for k, v := range data.Metadata {
+		gcsEvent.Metadata[k] = v
+	}
+
+	return LoadJobRunData(ctx, gcsEvent)
 }
 
 func LoadJobRunDataTest(ctx context.Context, e GCSEvent) error {
