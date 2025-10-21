@@ -55,6 +55,7 @@ const (
 	ProjectIdEnv          = "PROJECT_ID"
 	GCSCredentialsFileEnv = "GCS_CREDENTIALS_FILE" // local testing only
 	PRDataFiles           = "PR_DATA_FILES"
+	MatchDataFiles        = "MATCH_DATA_FILES"
 )
 
 var clientsCache *ClientsCache
@@ -66,6 +67,7 @@ type ClientsCache struct {
 	cachedTime     time.Time
 	prJobsEnabled  bool
 	prDataFiles    []string
+	matchDataFiles []string
 }
 
 func init() {
@@ -153,6 +155,15 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 		}
 	}
 
+	matchDataFiles := os.Getenv(MatchDataFiles)
+	if len(matchDataFiles) > 0 {
+		// use : as a delimiter
+		dataFiles := strings.Split(matchDataFiles, ":")
+		if len(dataFiles) > 0 {
+			newCache.matchDataFiles = dataFiles
+		}
+	}
+
 	// Technically we will leak connections since we
 	// initialize these globally and don't know when our CF will close
 	// but this is a trade-off for the 'warm start' and shouldn't be an issue
@@ -185,7 +196,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		return err
 	}
 
-	err = jobRunData.parseJob(clientsCache.prDataFiles)
+	err = jobRunData.parseJob(clientsCache.prDataFiles, clientsCache.matchDataFiles)
 	if err != nil {
 		logrus.Errorf("Returning parseJob error for %v", e)
 		return err
@@ -257,7 +268,7 @@ func generateJobRunDataEvent(event *GCSEvent) (*JobRunDataEvent, error) {
 	return &JobRunDataEvent{GCSEvent: event}, nil
 }
 
-func (j *JobRunDataEvent) parseJob(prDataFiles []string) error {
+func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
 	if j.GCSEvent == nil {
 		return fmt.Errorf("invalid GCSEvent")
 	}
@@ -321,6 +332,20 @@ func (j *JobRunDataEvent) parseJob(prDataFiles []string) error {
 	default:
 		// log.Printf("Skip job that is not postsubmit/periodic: %s", e.Name)
 		return nil
+	}
+
+	if len(matchDataFiles) > 0 {
+		found := false
+		for _, matchDataFile := range matchDataFiles {
+			if strings.HasPrefix(base, matchDataFile) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+		logrus.Infof("Data file match found for job for %s: Job: %s, Build: %s, Base: %s", j.GCSEvent.Name, job, build, base)
 	}
 
 	j.Filename = base

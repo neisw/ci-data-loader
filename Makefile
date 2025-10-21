@@ -6,9 +6,9 @@ deploy: build
 	gcloud functions deploy LoadJobRunData \
 		--project openshift-gce-devel --retry --runtime go121 \
 		--service-account job-run-big-query-writer@openshift-gce-devel.iam.gserviceaccount.com \
-		--memory 2048MB --timeout=300s --max-instances=40 \
+		--memory 2048MB --timeout=300s --max-instances=100 \
 		--trigger-resource test-platform-results --trigger-event google.storage.object.finalize \
-		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl,PR_DATA_FILES=risk-analysis-:retry_statistics \
+		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl,PR_DATA_FILES=risk-analysis-:retry-statistics \
 		--no-gen2 \
 		--docker-registry=artifact-registry
 .PHONY: deploy
@@ -19,7 +19,7 @@ deploy-test: build
 		--service-account job-run-big-query-writer@openshift-gce-devel.iam.gserviceaccount.com \
 		--memory 2048MB --timeout=300s --max-instances=10 \
 		--trigger-resource test-platform-results --trigger-event google.storage.object.finalize \
-		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl_test,PR_DATA_FILES=risk-analysis-:retry_statistics \
+		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl_test,PR_DATA_FILES=retry-statistics,MATCH_DATA_FILES=retry-statistics \
 		--no-gen2 \
 		--docker-registry=artifact-registry
 .PHONY: deploy-test
