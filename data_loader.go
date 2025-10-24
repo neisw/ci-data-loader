@@ -1,13 +1,14 @@
 package cidataloader
 
 import (
-	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
 	"time"
+
+	"cloud.google.com/go/storage"
 )
 
 type DataType = string
@@ -43,9 +44,9 @@ type DataInstance struct {
 }
 
 func generateDataFileUploader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader DataLoader) (SimpleUploader, error) {
-	o := client.Bucket(event.GCSEvent.Bucket).Object(event.GCSEvent.Name)
+	o := client.Bucket(event.Bucket).Object(event.Name)
 
-	creationTime := event.GCSEvent.TimeCreated
+	creationTime := event.TimeCreated
 	if creationTime.IsZero() {
 		attrs, err := o.Attrs(ctx)
 		if err != nil {

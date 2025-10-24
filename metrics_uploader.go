@@ -2,7 +2,6 @@ package cidataloader
 
 import (
 	"bytes"
-	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +9,8 @@ import (
 	"log"
 	"strconv"
 	"time"
+
+	"cloud.google.com/go/storage"
 )
 
 type metricsLoader struct {
@@ -19,11 +20,11 @@ type metricsLoader struct {
 func generateMetricsUploader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader DataLoader) (SimpleUploader, error) {
 
 	m := metricsLoader{}
-	if !event.GCSEvent.TimeCreated.IsZero() {
-		m.instanceTime = &event.GCSEvent.TimeCreated
+	if !event.TimeCreated.IsZero() {
+		m.instanceTime = &event.TimeCreated
 	}
 
-	rows, err := m.parseRows(client, ctx, event.GCSEvent.Bucket, event.GCSEvent.Name)
+	rows, err := m.parseRows(client, ctx, event.Bucket, event.Name)
 	if err != nil {
 		return nil, err
 	}
