@@ -15,18 +15,23 @@ deploy-service-account:
 
 deploy: build
 	gcloud functions deploy LoadJobRunData \
-		--project openshift-gce-devel --retry --runtime go121 \
+        --gen2 \
+        --region us-east1 \
+        --runtime go122 \
+        --source . \
+        --entry-point LoadJobRunDataCloudEvent \
+		--project openshift-gce-devel --retry \
 		--service-account job-run-big-query-writer@openshift-gce-devel.iam.gserviceaccount.com \
 		--memory 2048MB --timeout=300s --max-instances=100 \
-		--trigger-resource test-platform-results --trigger-event google.storage.object.finalize \
-		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl,PR_DATA_FILES=risk-analysis-:retry-statistics \
-		--no-gen2 \
-		--docker-registry=artifact-registry
+		--trigger-event-filters='type=google.cloud.storage.object.v1.finalized' \
+        --trigger-event-filters='bucket=test-platform-results' \
+		--set-env-vars PROJECT_ID=openshift-ci-data-analysis,DATASET_ID=ci_data_autodl,PR_DATA_FILES=risk-analysis-:retry-statistics
 .PHONY: deploy
 
 delete:
 	gcloud functions delete LoadJobRunData \
-		--project openshift-gce-devel
+		--project openshift-gce-devel \
+		--region us-east1
 .PHONY: delete
 
 deploy-test: build
