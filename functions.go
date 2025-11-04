@@ -1,52 +1,43 @@
 package cidataloader
 
 import (
-	"cloud.google.com/go/bigquery"
-	"cloud.google.com/go/storage"
 	"context"
 	"fmt"
-	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
-	"github.com/sirupsen/logrus"
-	"google.golang.org/api/option"
 	"os"
 	"path"
 	"regexp"
 	"strings"
 	"time"
+
+	"cloud.google.com/go/bigquery"
+	"cloud.google.com/go/storage"
+	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
+	"github.com/cloudevents/sdk-go/v2/event"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/api/option"
 )
 
-type GCSEvent struct {
-	Kind string `json:"kind"`
-	ID   string `json:"id"`
-	// SelfLink                string                 `json:"selfLink"`
-	Name   string `json:"name"`
-	Bucket string `json:"bucket"`
-	// Generation              string                 `json:"generation"`
-	// Metageneration          string                 `json:"metageneration"`
-	ContentType string    `json:"contentType"`
-	TimeCreated time.Time `json:"timeCreated"`
-	Updated     time.Time `json:"updated"`
-	// TemporaryHold           bool                   `json:"temporaryHold"`
-	// EventBasedHold          bool                   `json:"eventBasedHold"`
-	// RetentionExpirationTime time.Time              `json:"retentionExpirationTime"`
-	// StorageClass            string                 `json:"storageClass"`
-	// TimeStorageClassUpdated time.Time              `json:"timeStorageClassUpdated"`
-	Size      string `json:"size"`
-	MD5Hash   string `json:"md5Hash"`
-	MediaLink string `json:"mediaLink"`
-	// ContentEncoding         string                 `json:"contentEncoding"`
-	// ContentDisposition      string                 `json:"contentDisposition"`
-	// CacheControl            string                 `json:"cacheControl"`
-	Metadata map[string]interface{} `json:"metadata"`
-	// CRC32C                  string                 `json:"crc32c"`
-	// ComponentCount          int                    `json:"componentCount"`
-	// Etag                    string                 `json:"etag"`
-	// CustomerEncryption      struct {
-	// 	EncryptionAlgorithm string `json:"encryptionAlgorithm"`
-	// 	KeySha256           string `json:"keySha256"`
-	// }
-	// KMSKeyName    string `json:"kmsKeyName"`
-	// ResourceState string `json:"resourceState"`
+// StorageObjectData contains metadata about a Cloud Storage object.
+type StorageObjectData struct {
+	Bucket      string            `json:"bucket"`
+	Name        string            `json:"name"`
+	Size        int64             `json:"size,string"`
+	ContentType string            `json:"contentType"`
+	TimeCreated time.Time         `json:"timeCreated"`
+	Updated     time.Time         `json:"updated"`
+	MD5Hash     string            `json:"md5Hash"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+// JobRunDataEvent contains relevant event attributes
+type JobRunDataEvent struct {
+	Job         string
+	BuildID     string
+	Filename    string
+	Event       *event.Event
+	Name        string
+	Bucket      string
+	TimeCreated time.Time
 }
 
 const (
@@ -72,6 +63,8 @@ type ClientsCache struct {
 
 func init() {
 	initClientCache()
+	// Register the CloudEvent function for gen2
+	// functions.CloudEvent("LoadJobRunData", loadJobRunDataCloudEvent)
 }
 
 func initClientCache() {
@@ -172,11 +165,22 @@ func initGlobals(ctx context.Context) (*ClientsCache, error) {
 	return &newCache, nil
 }
 
-func LoadJobRunDataTest(ctx context.Context, e GCSEvent) error {
-	return LoadJobRunData(ctx, e)
+// LoadJobRunDataCloudEvent is the CloudEvent handler for gen2 functions
+func LoadJobRunDataCloudEvent(ctx context.Context, e event.Event) error {
+	logrus.Infof("Event ID: %s", e.ID())
+	logrus.Infof("Event Type: %s", e.Type())
+
+	var data StorageObjectData
+	if err := e.DataAs(&data); err != nil {
+		logrus.Errorf("Failed to parse CloudEvent data: %v", err)
+		return fmt.Errorf("event.DataAs: %w", err)
+	}
+
+	var jobRunDataEvent = JobRunDataEvent{Name: data.Name, TimeCreated: data.TimeCreated, Bucket: data.Bucket, Event: &e}
+	return LoadJobRunData(ctx, &jobRunDataEvent)
 }
 
-func LoadJobRunData(ctx context.Context, e GCSEvent) error {
+func LoadJobRunData(ctx context.Context, jobRunData *JobRunDataEvent) error {
 
 	var simpleUploader SimpleUploader
 	var err error
@@ -189,21 +193,14 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 		initClientCache()
 	}
 
-	jobRunData, err := generateJobRunDataEvent(&e)
-
-	if err != nil {
-		logrus.Errorf("Returning generateJobRunDataEvent error for %v", e)
-		return err
-	}
-
 	err = jobRunData.parseJob(clientsCache.prDataFiles, clientsCache.matchDataFiles)
 	if err != nil {
-		logrus.Errorf("Returning parseJob error for %v", e)
+		logrus.Errorf("Returning parseJob error for %v", jobRunData.Event)
 		return err
 	}
 
 	if len(jobRunData.BuildID) == 0 || len(jobRunData.Job) == 0 || len(jobRunData.Filename) == 0 {
-		logrus.Debugf("Skipping event for: %v", e)
+		logrus.Debugf("Skipping event for: %v", jobRunData.Event)
 		return nil
 	}
 
@@ -234,7 +231,7 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	// no point returning error if we can't process it
 	// see cases where a bad file is continually reprocessed
 	if err != nil {
-		logwithctx(ctx).Errorf("Failed to initialize simple loader: %v - %v", err, e)
+		logwithctx(ctx).Errorf("Failed to initialize simple loader: %v - %v", err, jobRunData.Event)
 		return nil
 	}
 
@@ -253,27 +250,12 @@ func LoadJobRunData(ctx context.Context, e GCSEvent) error {
 	return nil
 }
 
-type JobRunDataEvent struct {
-	Job      string
-	BuildID  string
-	Filename string
-	GCSEvent *GCSEvent
-}
-
-func generateJobRunDataEvent(event *GCSEvent) (*JobRunDataEvent, error) {
-	if event == nil {
-		return nil, fmt.Errorf("missing gcs event")
-	}
-
-	return &JobRunDataEvent{GCSEvent: event}, nil
-}
-
 func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
-	if j.GCSEvent == nil {
-		return fmt.Errorf("invalid GCSEvent")
+	if len(j.Name) == 0 {
+		return fmt.Errorf("invalid event name")
 	}
 
-	parts := strings.Split(j.GCSEvent.Name, "/")
+	parts := strings.Split(j.Name, "/")
 	if len(parts) < 4 {
 		return nil
 	}
@@ -284,7 +266,7 @@ func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
 
 		job = parts[1]
 		build = parts[2]
-		base = path.Base(j.GCSEvent.Name)
+		base = path.Base(j.Name)
 
 		switch {
 		case strings.HasPrefix(job, "periodic-ci-openshift-release-"),
@@ -295,7 +277,7 @@ func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
 		}
 	case parts[0] == "pr-logs":
 		// we want to collect limited artifacts for pr jobs
-		fileNameBase := path.Base(j.GCSEvent.Name)
+		fileNameBase := path.Base(j.Name)
 		collectPrArtifacts := false
 		for _, prefix := range prDataFiles {
 			if strings.HasPrefix(fileNameBase, prefix) {
@@ -312,14 +294,14 @@ func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
 		// try to detect if the 4 index is numeric, if not bump it out 1
 
 		if len(parts) < 5 {
-			logrus.Infof("Unexpected job path for parsing build id from pr-logs job:  %s", j.GCSEvent.Name)
+			logrus.Infof("Unexpected job path for parsing build id from pr-logs job:  %s", j.Name)
 			return nil
 		}
 		if !buildIdMatch.MatchString(parts[baseIndex+padding+1]) {
 			if len(parts) > 5 {
 				padding += 1
 			} else {
-				logrus.Infof("failed to parse build id for pr-logs job:  %s", j.GCSEvent.Name)
+				logrus.Infof("failed to parse build id for pr-logs job:  %s", j.Name)
 				return nil
 			}
 
@@ -328,7 +310,7 @@ func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
 		job = parts[baseIndex+padding]
 		build = parts[baseIndex+padding+1]
 		base = fileNameBase
-		logrus.Infof("pr-logs job for %s: Job: %s, Build: %s, Base: %s", j.GCSEvent.Name, job, build, base)
+		logrus.Infof("pr-logs job for %s: Job: %s, Build: %s, Base: %s", j.Name, job, build, base)
 	default:
 		// log.Printf("Skip job that is not postsubmit/periodic: %s", e.Name)
 		return nil
@@ -345,7 +327,7 @@ func (j *JobRunDataEvent) parseJob(prDataFiles, matchDataFiles []string) error {
 		if !found {
 			return nil
 		}
-		logrus.Infof("Data file match found for job for %s: Job: %s, Build: %s, Base: %s", j.GCSEvent.Name, job, build, base)
+		logrus.Infof("Data file match found for job for %s: Job: %s, Build: %s, Base: %s", j.Name, job, build, base)
 	}
 
 	j.Filename = base

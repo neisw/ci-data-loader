@@ -104,7 +104,7 @@ func (i *intervalLoader) getJSON(bytes []byte) (map[string]any, error) {
 func generateStreamingComplexIntervalLoader(client *storage.Client, ctx context.Context, event *JobRunDataEvent, dataLoader *BigQueryLoader) error {
 
 	i := intervalLoader{}
-	o := client.Bucket(event.GCSEvent.Bucket).Object(event.GCSEvent.Name)
+	o := client.Bucket(event.Bucket).Object(event.Name)
 
 	if i.instanceTime == nil {
 		attrs, err := o.Attrs(ctx)
